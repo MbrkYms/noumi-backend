@@ -31,7 +31,7 @@ last_msg_time = None
 
 # ===== FONCTION POUR REMPLACER load_json/save_json =====
 async def get_memory():
-    if not collection_memory: 
+    if collection_memory is None: # <-- FIX 1: is None au lieu de not
         return { "user_id": "yamine", "user": {"last_login": "1970-01-01"}, "emotion_history": [], "self_diagnostics": [], "patches": [] }
     mem = collection_memory.find_one({"user_id": "yamine"})
     if not mem:
@@ -47,13 +47,13 @@ async def get_memory():
     return mem
 
 async def save_memory(mem):
-    if collection_memory:
+    if collection_memory is not None: # <-- FIX 2: is not None au lieu de if
         collection_memory.update_one({"user_id": "yamine"}, {"$set": mem}, upsert=True)
 
 @app.on_event("startup")
 async def startup():
     start_heartbeat() # <-- LANCE LE HEARTBEAT DE AI_ROUTER
-    logger.info("STELLIA V3.3.1 Démarrée")
+    logger.info("STELLIA V3.3.2 Démarrée")
 
 async def get_report():
     m = await get_memory()
@@ -66,7 +66,7 @@ async def ws(websocket: WebSocket):
     global last_msg_time
     await websocket.accept()
     report = await get_report()
-    await websocket.send_json({"response": f"Salut Yamine. Je suis Stellia. {report}", "self": {"version":"3.3.1"}})
+    await websocket.send_json({"response": f"Salut Yamine. Je suis Stellia. {report}", "self": {"version":"3.3.2"}})
     m = await get_memory()
     m["user"]["last_login"] = datetime.datetime.now().isoformat() # FIX: datetime.datetime
     await save_memory(m)
@@ -87,7 +87,7 @@ async def ws(websocket: WebSocket):
         await save_memory(m)
         # FIX: On ajoute les sources + model_used
         ai_data["self"] = {
-            "version": "3.3.1",
+            "version": "3.3.2",
             "latency_ms": int(latency),
             "sources": ai_data.get("sources", [])
         }
