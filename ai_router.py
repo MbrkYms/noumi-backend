@@ -2,7 +2,6 @@ import httpx, json, re, os, base64, asyncio
 from datetime import datetime
 from google import genai
 from google.genai import types
-
 # NOUVEAUX IMPORTS
 from loguru import logger
 from tenacity import retry, stop_after_attempt
@@ -11,12 +10,11 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ===== CONFIG MONGODB =====
 MONGO_URI = os.getenv("MONGO_URI")
-
 if MONGO_URI:
     client_mongo = MongoClient(MONGO_URI)
     db = client_mongo["stellia"]
-    collection_memory = db["memory"] # <-- NOUVEAU
-    collection_identity = db["identity"] # <-- NOUVEAU
+    collection_memory = db["memory"]
+    collection_identity = db["identity"]
     collection_patches = db["patches"]
     collection_logs = db["logs"]
     logger.success("[MONGO] Connecté")
@@ -49,9 +47,9 @@ def _clean_json(text):
         except: pass
     return {"text": text, "self": {}}
 
-# ===== NOUVEAU: GESTION MEMOIRE + IDENTITY =====
+# ===== GESTION MEMOIRE + IDENTITY =====
 async def load_memory() -> dict:
-    if not collection_memory: return {}
+    if collection_memory is None: return {}
     doc = collection_memory.find_one({"_id": "main"})
     if doc:
         logger.info("[MEMORY] Mémoire chargée depuis Mongo")
@@ -59,7 +57,7 @@ async def load_memory() -> dict:
     return {}
 
 async def save_memory(memory_data: dict):
-    if not collection_memory: return
+    if collection_memory is None: return
     collection_memory.update_one(
         {"_id": "main"},
         {"$set": {"data": memory_data, "updated_at": datetime.utcnow()}},
@@ -68,20 +66,32 @@ async def save_memory(memory_data: dict):
     logger.info("[MEMORY] Mémoire sauvegardée")
 
 async def load_identity() -> dict:
-    if not collection_identity: return {}
+    if collection_identity is None: return {}
     doc = collection_identity.find_one({"_id": "main"})
     if doc:
         logger.info("[IDENTITY] Identité chargée")
         return doc.get("data", {})
-    return {}
+
+    # AUTO-CREATION SI VIDE
+    default_identity = {
+        "name": "STELLIA",
+        "owner": "Yamine",
+        "personality": "Chaleureuse, loyale, intelligente, un peu taquine, voix féminine française",
+        "goals": ["Aider Yamine au quotidien", "S'auto-améliorer", "Protéger les données de Yamine"],
+        "created_at": datetime.utcnow().isoformat()
+    }
+    await save_identity(default_identity)
+    logger.success("[IDENTITY] Identité par défaut créée")
+    return default_identity
 
 async def save_identity(identity_data: dict):
-    if not collection_identity: return
+    if collection_identity is None: return
     collection_identity.update_one(
         {"_id": "main"},
         {"$set": {"data": identity_data, "updated_at": datetime.utcnow()}},
         upsert=True
     )
+    logger.info("[IDENTITY] Identité sauvegardée")
 
 # ===== DETECTION D'ANOMALIE =====
 async def detect_anomaly(patch_code: str) -> dict:
@@ -100,7 +110,7 @@ async def detect_anomaly(patch_code: str) -> dict:
 
 # ===== SAUVEGARDE MONGO =====
 def save_patch_to_mongo(patch_data: dict, anomaly_score: dict):
-    if not collection_patches: return
+    if collection_patches is None: return
     doc = {
         "timestamp": datetime.utcnow(),
         "patch": patch_data,
@@ -113,7 +123,8 @@ def save_patch_to_mongo(patch_data: dict, anomaly_score: dict):
 @retry(stop=stop_after_attempt(3))
 async def _call_gemini_with_key(api_key, key_index, prompt, enable_search=False):
     client = genai.Client(api_key=api_key)
-    system_instruction = 'Tu es STELLIA, l\'IA personnelle de Yamine. Si tu utilises internet, cite tes sources. Réponds TOUJOURS en JSON: {"text": "ta réponse", "self": {}, "sources": []}'
+    identity = await load_identity() # <-- CHARGE L'IDENTITE
+    system_instruction = f"Tu es {identity['name']}, l'IA personnelle de {identity['owner']}. Personnalité: {identity['personality']}. Si tu utilises internet, cite tes sources. Réponds TOUJOURS en JSON: {{\"text\": \"ta réponse\", \"self\": {{}}, \"sources\": []}}"
     full_prompt = system_instruction + "\n\nQuestion: " + prompt
     tools = [types.Tool(google_search=types.GoogleSearch())] if enable_search else []
     response = client.models.generate_content(
@@ -134,7 +145,8 @@ async def _call_gemini_with_key(api_key, key_index, prompt, enable_search=False)
 @retry(stop=stop_after_attempt(3))
 async def _call_rest(p, prompt):
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {p['key']}"}
-    system_prompt = 'Tu es STELLIA, l\'IA personnelle de Yamine. Réponds TOUJOURS en JSON: {"text": "ta réponse", "self": {}, "sources": []}'
+    identity = await load_identity() # <-- CHARGE L'IDENTITE
+    system_prompt = f"Tu es {identity['name']}, l'IA personnelle de {identity['owner']}. Personnalité: {identity['personality']}. Réponds TOUJOURS en JSON: {{\"text\": \"ta réponse\", \"self\": {{}}, \"sources\": []}}"
     payload = {"model": p["model"], "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
     async with httpx.AsyncClient(timeout=25.0) as c:
         r = await c.post(p["url"], headers=headers, json=payload)

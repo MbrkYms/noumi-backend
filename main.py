@@ -3,7 +3,7 @@ from fastapi import FastAPI, WebSocket, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv; load_dotenv()
-from ai_router import ask_ai, start_heartbeat # <-- ON IMPORTE LE NOUVEAU HEARTBEAT
+from ai_router import ask_ai, start_heartbeat, load_identity # <-- ON IMPORTE LOAD_IDENTITY
 from analyzer import analyze_user
 from diagnostic import diagnose_self
 # NOUVEAUX IMPORTS
@@ -53,7 +53,8 @@ async def save_memory(mem):
 @app.on_event("startup")
 async def startup():
     start_heartbeat() # <-- LANCE LE HEARTBEAT DE AI_ROUTER
-    logger.info("STELLIA V3.3.2 Démarrée")
+    identity = await load_identity() # <-- CHARGE L'IDENTITE AU DEMARRAGE
+    logger.info(f"STELLIA V3.3.3 Démarrée. Identité: {identity.get('name', 'STELLIA')}")
 
 async def get_report():
     m = await get_memory()
@@ -65,33 +66,48 @@ async def get_report():
 async def ws(websocket: WebSocket):
     global last_msg_time
     await websocket.accept()
+    
+    identity = await load_identity() # <-- CHARGE L'IDENTITE
+    name = identity.get("name", "Stellia")
     report = await get_report()
-    await websocket.send_json({"response": f"Salut Yamine. Je suis Stellia. {report}", "self": {"version":"3.3.2"}})
+    
+    await websocket.send_json({
+        "response": f"Salut Yamine. Je suis {name}. {report}", 
+        "self": {"version":"3.3.3", "identity": identity}
+    })
+    
     m = await get_memory()
     m["user"]["last_login"] = datetime.datetime.now().isoformat() # FIX: datetime.datetime
     await save_memory(m)
+    
     while True:
         data = await websocket.receive_json()
         user_text = data.get("user_input", "")
         last_msg_time = datetime.datetime.now() # FIX: datetime.datetime
+        
         user_params = await analyze_user(user_text, last_msg_time)
         m = await get_memory()
         m["emotion_history"].append({"timestamp": str(last_msg_time), "params": user_params})
         await save_memory(m)
+        
         start = time.time()
         ai_data = await ask_ai(user_text, enable_search=True) # ACTIVE LA RECHERCHE
         latency = (time.time() - start) * 1000
+        
         self_diag = await diagnose_self(latency)
         m = await get_memory()
         m["self_diagnostics"].append(self_diag)
         await save_memory(m)
-        # FIX: On ajoute les sources + model_used
+        
+        # FIX: On ajoute les sources + model_used + identity
         ai_data["self"] = {
-            "version": "3.3.2",
+            "version": "3.3.3",
             "latency_ms": int(latency),
-            "sources": ai_data.get("sources", [])
+            "sources": ai_data.get("sources", []),
+            "identity_name": identity.get("name")
         }
         ai_data["response"] = ai_data.get("text", "Je n'ai pas compris")
+        
         await websocket.send_json(ai_data)
 
 # ===== ROUTE TTS GEMINI - REMPLACE GOOGLE TTS =====
