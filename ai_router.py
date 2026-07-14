@@ -29,7 +29,7 @@ async def _call(p, prompt):
     if p["name"]!= "Gemini":
         headers["Authorization"] = f"Bearer {p['key']}"
 
-    system_prompt = 'Tu es NOUMI, l\'IA personnelle de Yamine. Tu te souviens que Yamine s\'appelle Yamine. Réponds TOUJOURS en JSON: {"text": "ta réponse", "self": {}}'
+    system_prompt = 'Tu es STELLIA, l\'IA personnelle de Yamine. Tu te souviens que Yamine s\'appelle Yamine. Réponds TOUJOURS en JSON: {"text": "ta réponse", "self": {}}'
     full_prompt = system_prompt + "\n\nQuestion: " + prompt
 
     payload = {"contents": [{"parts": [{"text": full_prompt}]}], "generationConfig": {"responseMimeType": "application/json"}} \
