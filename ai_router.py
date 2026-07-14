@@ -1,6 +1,5 @@
 import httpx, json, re, os
 from google import genai
-from google.genai import types
 
 GEMINI_KEY = os.getenv("GEMINI_KEY")
 DEEPSEEK_KEY = os.getenv("DEEPSEEK_KEY")
@@ -24,26 +23,30 @@ def _clean_json(text):
     return {"text": text, "self": {}}
 
 async def _call_gemini(prompt, enable_search=False):
-    system_prompt = 'Tu es STELLIA, l\'IA personnelle de Yamine. Si tu utilises internet, cite tes sources. Réponds TOUJOURS en JSON: {"text": "ta réponse", "self": {}, "sources": []}'
-    full_prompt = system_prompt + "\n\nQuestion: " + prompt
+    system_instruction = 'Tu es STELLIA, l\'IA personnelle de Yamine. Si tu utilises internet, cite tes sources. Réponds TOUJOURS en JSON: {"text": "ta réponse", "self": {}, "sources": []}'
 
-    tools = []
+    generation_config = {
+        "response_mime_type": "application/json",
+        "thinking_level": "low",
+        "temperature": 0.9
+    }
+
     if enable_search:
-        tools = [types.Tool(google_search=types.GoogleSearch())]
+        generation_config["tools"] = [{"google_search": {}}]
 
-    response = client.models.generate_content(
+    interaction = client.interactions.create(
         model="gemini-2.5-flash", # <-- TON MODÈLE STABLE
-        contents=full_prompt,
-        config=types.GenerateContentConfig(
-            tools=tools,
-            response_mime_type="application/json"
-        )
+        system_instruction=system_instruction,
+        input=prompt,
+        generation_config=generation_config
     )
 
-    text = response.text
+    text = interaction.output_text
     sources = []
-    if response.candidates and response.candidates[0].grounding_metadata:
-        for chunk in response.candidates[0].grounding_metadata.grounding_chunks:
+
+    # RECUP SOURCES GOOGLE SEARCH
+    if hasattr(interaction, 'grounding_metadata') and interaction.grounding_metadata:
+        for chunk in interaction.grounding_metadata.grounding_chunks:
             if chunk.web:
                 sources.append(chunk.web.uri)
 
@@ -75,23 +78,21 @@ async def ask_ai(prompt, enable_search=False):
 
     if needs_search:
         try:
-            use_search = True
-            print(f"[ROUTER] Tentative Gemini-2.5 search={use_search}")
+            print(f"[ROUTER] Tentative Gemini-2.5 SDK search=True")
             return await _call_gemini(prompt, enable_search=True)
         except Exception as e:
             print(f"[ROUTER] Gemini KO: {e}")
             last_error = str(e)
+            return {"text": f"Bug Gemini: {last_error[:100]}", "self": {}, "sources": []}
     else:
         for p in PROVIDERS:
             try:
-                use_search = False
-                print(f"[ROUTER] Tentative {p['name']} search={use_search}")
+                print(f"[ROUTER] Tentative {p['name']} search=False")
                 return await _call_rest(p, prompt)
             except Exception as e:
                 print(f"[ROUTER] {p['name']} KO: {e}")
                 last_error = str(e)
-
-    return {"text": f"Bug: {last_error[:100]}", "self": {}, "sources": []}
+        return {"text": f"Bug: {last_error[:100]}", "self": {}, "sources": []}
 
 # TTS
 from fastapi import APIRouter, Request
