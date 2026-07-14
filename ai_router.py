@@ -5,7 +5,7 @@ GROQ_KEY = os.getenv("GROQ_KEY")
 TTS_API_KEY = os.getenv("TTS_API_KEY")
 
 PROVIDERS = [
-    {"name": "Gemini", "url": f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}", "search": True},
+    {"name": "Gemini", "url": f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_KEY}", "search": True}, # <-- MAJ ICI
     {"name": "Groq", "url": "https://api.groq.com/openai/v1/chat/completions", "key": GROQ_KEY, "model": "llama-3.1-8b-instant", "search": False},
     {"name": "DeepSeek", "url": "https://api.deepseek.com/chat/completions", "key": DEEPSEEK_KEY, "model": "deepseek-chat", "search": False}
 ]
@@ -31,7 +31,6 @@ async def _call(p, prompt, enable_search=False):
             "contents": [{"parts": parts}],
             "generationConfig": {"responseMimeType": "application/json"}
         }
-        # FIX 1: tools doit être dans payload même si False sinon erreur
         if enable_search:
             payload["tools"] = [{"google_search": {}}]
     else:
@@ -70,7 +69,6 @@ async def _call(p, prompt, enable_search=False):
 async def ask_ai(prompt, enable_search=False):
     needs_search = any(k in prompt.lower() for k in ["actu", "météo", "prix", "cours", "aujourd'hui", "maintenant", "google", "recherche", "news"])
 
-    # FIX 2: syntaxe corrigée du if/else
     if needs_search:
         providers_to_try = [p for p in PROVIDERS if p["name"]=="Gemini"]
     else:
