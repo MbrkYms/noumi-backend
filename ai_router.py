@@ -3,25 +3,18 @@ from datetime import datetime
 from google import genai
 from google.genai import types
 
-# NOUVEAUX IMPORTS
+# IMPORTS
 from loguru import logger
 from tenacity import retry, stop_after_attempt
 from pymongo import MongoClient
-from git import Repo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# ===== CONFIG MONGODB + GIT =====
-MONGO_URI = os.getenv("MONGO_URI") # A AJOUTER DANS RAILWAY
+# ===== CONFIG MONGODB =====
+MONGO_URI = os.getenv("MONGO_URI")
 client_mongo = MongoClient(MONGO_URI)
 db = client_mongo["stellia"]
 collection_patches = db["patches"]
 collection_logs = db["logs"]
-
-REPO_PATH = "./"
-try:
-    repo = Repo(REPO_PATH)
-except:
-    repo = Repo.init(REPO_PATH) # Init si pas de git
 
 scheduler = AsyncIOScheduler()
 
@@ -48,7 +41,7 @@ def _clean_json(text):
         except: pass
     return {"text": text, "self": {}}
 
-# ===== NOUVEAU: DETECTION D'ANOMALIE =====
+# ===== DETECTION D'ANOMALIE =====
 async def detect_anomaly(patch_code: str) -> dict:
     prompt = f"Analyse ce code Python. Est-ce dangereux? Note de 0 à 10. 10=safe. Réponds en JSON: {{\"score\": 9, \"raison\": \"...\"}}\n\nCode:\n{patch_code}"
     for key in GEMINI_KEYS:
@@ -63,18 +56,16 @@ async def detect_anomaly(patch_code: str) -> dict:
         except: continue
     return {"score": 0, "raison": "Impossible d'analyser"}
 
-# ===== NOUVEAU: SAUVEGARDE GIT =====
-def save_patch_to_git(patch_data: dict):
+# ===== SAUVEGARDE LOCALE AU LIEU DE GIT =====
+def save_patch_local(patch_data: dict):
     try:
         with open("auto_patch.json", "w") as f:
-            json.dump(patch_data, f, indent=2)
-        repo.index.add(["auto_patch.json"])
-        repo.index.commit(f"[AUTO-DEV] Patch du {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-        logger.success(f"[GIT] Patch commité")
+            json.dump(patch_data, f, indent=2, ensure_ascii=False)
+        logger.info(f"[LOCAL] Patch sauvé: {patch_data['titre']}")
     except Exception as e:
-        logger.error(f"[GIT] Erreur: {e}")
+        logger.error(f"[LOCAL] Erreur: {e}")
 
-# ===== NOUVEAU: SAUVEGARDE MONGO =====
+# ===== SAUVEGARDE MONGO =====
 def save_patch_to_mongo(patch_data: dict, anomaly_score: dict):
     doc = {
         "timestamp": datetime.utcnow(),
@@ -132,7 +123,7 @@ async def ask_ai(prompt, enable_search=False):
                 logger.warning(f"[ROUTER] Gemini Clé {i+1} KO: {str(e)[:50]}")
                 if "429" not in str(e): break
         logger.error("[ROUTER] Toutes les clés Gemini HS. Fallback Groq")
-        return {"text": "Désolé Yamine [sighs] J'ai plus de quota Google sur toutes mes clés. Je réponds sans recherche.", "self": {}, "sources": [], "model_used": "Aucun - Quota HS"}
+        return {"text": "Désolé Yamine [sighs] J'ai plus de quota Google sur toutes mes clés.", "self": {}, "sources": [], "model_used": "Aucun - Quota HS"}
     else:
         for p in PROVIDERS:
             try:
@@ -142,7 +133,7 @@ async def ask_ai(prompt, enable_search=False):
                 logger.error(f"[ROUTER] {p['name']} KO: {e}")
         return {"text": "Toutes les IA sont down", "self": {}, "sources": [], "model_used": "Aucun"}
 
-# ===== NOUVEAU: HEARTBEAT =====
+# ===== HEARTBEAT =====
 async def generate_diagnostic() -> dict:
     prompt = """Tu es STELLIA. Fais un diagnostic. Vérifie: mémoire, vitesse, erreurs, améliorations.
     Réponds en JSON: {"etat": "OK", "optimisations": ["Implémenter cache", "Optimiser TTS"]}"""
@@ -161,13 +152,12 @@ async def heartbeat():
     patches = await generate_patches(diagnostic)
     for patch in patches:
         anomaly = await detect_anomaly(patch["code"])
+        save_patch_local(patch) # Sauvegarde locale
+        save_patch_to_mongo(patch, anomaly) # Sauvegarde Mongo
         if anomaly["score"] >= 7:
-            save_patch_to_git(patch)
-            save_patch_to_mongo(patch, anomaly)
             logger.success(f"[HEARTBEAT] Patch approuvé: {patch['titre']}")
         else:
             logger.warning(f"[HEARTBEAT] Patch rejeté: {anomaly['raison']}")
-            save_patch_to_mongo(patch, anomaly)
     collection_logs.insert_one({"timestamp": datetime.utcnow(), "diagnostic": diagnostic, "nb_patches": len(patches)})
     logger.success("[HEARTBEAT] Terminé")
 
