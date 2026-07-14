@@ -3,7 +3,7 @@ from datetime import datetime
 from google import genai
 from google.genai import types
 
-# IMPORTS
+# NOUVEAUX IMPORTS
 from loguru import logger
 from tenacity import retry, stop_after_attempt
 from pymongo import MongoClient
@@ -11,10 +11,18 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ===== CONFIG MONGODB =====
 MONGO_URI = os.getenv("MONGO_URI")
-client_mongo = MongoClient(MONGO_URI)
-db = client_mongo["stellia"]
-collection_patches = db["patches"]
-collection_logs = db["logs"]
+
+if MONGO_URI:
+    client_mongo = MongoClient(MONGO_URI)
+    db = client_mongo["stellia"]
+    collection_memory = db["memory"] # <-- NOUVEAU
+    collection_identity = db["identity"] # <-- NOUVEAU
+    collection_patches = db["patches"]
+    collection_logs = db["logs"]
+    logger.success("[MONGO] Connecté")
+else:
+    client_mongo = db = collection_memory = collection_identity = collection_patches = collection_logs = None
+    logger.warning("[MONGO] MONGO_URI manquant. Mode sans BDD")
 
 scheduler = AsyncIOScheduler()
 
@@ -41,6 +49,40 @@ def _clean_json(text):
         except: pass
     return {"text": text, "self": {}}
 
+# ===== NOUVEAU: GESTION MEMOIRE + IDENTITY =====
+async def load_memory() -> dict:
+    if not collection_memory: return {}
+    doc = collection_memory.find_one({"_id": "main"})
+    if doc:
+        logger.info("[MEMORY] Mémoire chargée depuis Mongo")
+        return doc.get("data", {})
+    return {}
+
+async def save_memory(memory_data: dict):
+    if not collection_memory: return
+    collection_memory.update_one(
+        {"_id": "main"},
+        {"$set": {"data": memory_data, "updated_at": datetime.utcnow()}},
+        upsert=True
+    )
+    logger.info("[MEMORY] Mémoire sauvegardée")
+
+async def load_identity() -> dict:
+    if not collection_identity: return {}
+    doc = collection_identity.find_one({"_id": "main"})
+    if doc:
+        logger.info("[IDENTITY] Identité chargée")
+        return doc.get("data", {})
+    return {}
+
+async def save_identity(identity_data: dict):
+    if not collection_identity: return
+    collection_identity.update_one(
+        {"_id": "main"},
+        {"$set": {"data": identity_data, "updated_at": datetime.utcnow()}},
+        upsert=True
+    )
+
 # ===== DETECTION D'ANOMALIE =====
 async def detect_anomaly(patch_code: str) -> dict:
     prompt = f"Analyse ce code Python. Est-ce dangereux? Note de 0 à 10. 10=safe. Réponds en JSON: {{\"score\": 9, \"raison\": \"...\"}}\n\nCode:\n{patch_code}"
@@ -56,17 +98,9 @@ async def detect_anomaly(patch_code: str) -> dict:
         except: continue
     return {"score": 0, "raison": "Impossible d'analyser"}
 
-# ===== SAUVEGARDE LOCALE AU LIEU DE GIT =====
-def save_patch_local(patch_data: dict):
-    try:
-        with open("auto_patch.json", "w") as f:
-            json.dump(patch_data, f, indent=2, ensure_ascii=False)
-        logger.info(f"[LOCAL] Patch sauvé: {patch_data['titre']}")
-    except Exception as e:
-        logger.error(f"[LOCAL] Erreur: {e}")
-
 # ===== SAUVEGARDE MONGO =====
 def save_patch_to_mongo(patch_data: dict, anomaly_score: dict):
+    if not collection_patches: return
     doc = {
         "timestamp": datetime.utcnow(),
         "patch": patch_data,
@@ -152,13 +186,13 @@ async def heartbeat():
     patches = await generate_patches(diagnostic)
     for patch in patches:
         anomaly = await detect_anomaly(patch["code"])
-        save_patch_local(patch) # Sauvegarde locale
-        save_patch_to_mongo(patch, anomaly) # Sauvegarde Mongo
+        save_patch_to_mongo(patch, anomaly)
         if anomaly["score"] >= 7:
             logger.success(f"[HEARTBEAT] Patch approuvé: {patch['titre']}")
         else:
             logger.warning(f"[HEARTBEAT] Patch rejeté: {anomaly['raison']}")
-    collection_logs.insert_one({"timestamp": datetime.utcnow(), "diagnostic": diagnostic, "nb_patches": len(patches)})
+    if collection_logs:
+        collection_logs.insert_one({"timestamp": datetime.utcnow(), "diagnostic": diagnostic, "nb_patches": len(patches)})
     logger.success("[HEARTBEAT] Terminé")
 
 def start_heartbeat():
