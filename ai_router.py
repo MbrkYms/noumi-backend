@@ -5,8 +5,8 @@ from google.genai import types
 # ON CHARGE TOUTES LES CLÉS GEMINI
 GEMINI_KEYS = [k for k in [
     os.getenv("GEMINI_KEY"),
-    os.getenv("GEMINI_KEY_2"), # <-- AJOUTE ÇA DANS RAILWAY
-    os.getenv("GEMINI_KEY_3") # <-- AJOUTE ÇA DANS RAILWAY
+    os.getenv("GEMINI_KEY_2"),
+    os.getenv("GEMINI_KEY_3")
 ] if k]
 
 DEEPSEEK_KEY = os.getenv("DEEPSEEK_KEY")
@@ -25,8 +25,8 @@ def _clean_json(text):
         except: pass
     return {"text": text, "self": {}}
 
-async def _call_gemini_with_key(api_key, prompt, enable_search=False):
-    client = genai.Client(api_key=api_key) # <-- NOUVEAU CLIENT PAR CLÉ
+async def _call_gemini_with_key(api_key, key_index, prompt, enable_search=False):
+    client = genai.Client(api_key=api_key)
 
     system_instruction = 'Tu es STELLIA, l\'IA personnelle de Yamine. Si tu utilises internet, cite tes sources. Réponds TOUJOURS en JSON: {"text": "ta réponse", "self": {}, "sources": []}'
     full_prompt = system_instruction + "\n\nQuestion: " + prompt
@@ -53,6 +53,7 @@ async def _call_gemini_with_key(api_key, prompt, enable_search=False):
 
     result = _clean_json(text)
     result["sources"] = sources
+    result["model_used"] = f"Gemini-2.5-Flash [Clé {key_index}]" # <-- AJOUT
     return result
 
 async def _call_rest(p, prompt):
@@ -70,6 +71,7 @@ async def _call_rest(p, prompt):
         text = data["choices"][0]["message"]["content"]
         result = _clean_json(text)
         result["sources"] = []
+        result["model_used"] = p["name"] # <-- AJOUT
         return result
 
 async def ask_ai(prompt, enable_search=False):
@@ -81,7 +83,7 @@ async def ask_ai(prompt, enable_search=False):
         for i, key in enumerate(GEMINI_KEYS):
             try:
                 print(f"[ROUTER] Tentative Gemini Clé {i+1}/{len(GEMINI_KEYS)} search=True")
-                return await _call_gemini_with_key(key, prompt, enable_search=True)
+                return await _call_gemini_with_key(key, i+1, prompt, enable_search=True)
             except Exception as e:
                 error_str = str(e)
                 print(f"[ROUTER] Gemini Clé {i+1} KO: {error_str[:50]}")
@@ -92,7 +94,7 @@ async def ask_ai(prompt, enable_search=False):
         # SI TOUTES LES CLÉS SONT HS -> FALLBACK
         print("[ROUTER] Toutes les clés Gemini HS. Fallback Groq")
         fallback_text = "Désolé Yamine [sighs] J'ai plus de quota Google sur toutes mes clés. Je réponds sans recherche pour l'instant."
-        return {"text": fallback_text, "self": {}, "sources": []}
+        return {"text": fallback_text, "self": {}, "sources": [], "model_used": "Aucun - Quota HS"} # <-- AJOUT
 
     else: # PAS BESOIN DE RECHERCHE
         for p in PROVIDERS:
@@ -101,7 +103,7 @@ async def ask_ai(prompt, enable_search=False):
                 return await _call_rest(p, prompt)
             except Exception as e:
                 print(f"[ROUTER] {p['name']} KO: {e}")
-        return {"text": "Toutes les IA sont down", "self": {}, "sources": []}
+        return {"text": "Toutes les IA sont down", "self": {}, "sources": [], "model_used": "Aucun"} # <-- AJOUT
 
 # TTS GEMINI - utilise la première clé dispo
 from fastapi import APIRouter, Request
@@ -111,10 +113,9 @@ router = APIRouter()
 async def text_to_speech(req: Request):
     data = await req.json()
     text = data.get("text", "")
-
     if not GEMINI_KEYS: return {"error": "Aucune GEMINI_KEY trouvée"}
 
-    client = genai.Client(api_key=GEMINI_KEYS[0]) # On prend la clé 1 pour TTS
+    client = genai.Client(api_key=GEMINI_KEYS[0])
 
     prompt_tts = f"""# AUDIO PROFILE: Stellia
 ## THE SCENE: Appel vocal privé avec Yamine
