@@ -5,11 +5,8 @@ GROQ_KEY = os.getenv("GROQ_KEY")
 TTS_API_KEY = os.getenv("TTS_API_KEY")
 
 PROVIDERS = [
-    # 1. GROQ EN PREMIER - Le plus rapide mais PAS de recherche
     {"name": "Groq", "url": "https://api.groq.com/openai/v1/chat/completions", "key": GROQ_KEY, "model": "llama-3.1-8b-instant", "search": False},
-    # 2. GEMINI EN 2EME - Lui peut chercher
     {"name": "Gemini", "url": f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_KEY}", "search": True},
-    # 3. DEEPSEEK EN DERNIER - PAS de recherche
     {"name": "DeepSeek", "url": "https://api.deepseek.com/chat/completions", "key": DEEPSEEK_KEY, "model": "deepseek-chat", "search": False}
 ]
 
@@ -26,7 +23,7 @@ async def _call(p, prompt, enable_search=False):
     if p["name"]!= "Gemini":
         headers["Authorization"] = f"Bearer {p['key']}"
 
-    system_prompt = 'Tu es STELLIA, l\'IA personnelle de Yamine. Tu te souviens que Yamine s\'appelle Yamine. Si on te demande une info actuelle, actu, météo, prix, tu dois le dire. Réponds TOUJOURS en JSON: {"text": "ta réponse", "self": {}, "sources": []}'
+    system_prompt = 'Tu es STELLIA, l\'IA personnelle de Yamine. Tu te souviens que Yamine s\'appelle Yamine. Si on te demande une info actuelle, actu, météo, prix, tu dois chercher. Réponds TOUJOURS en JSON: {"text": "ta réponse", "self": {}, "sources": []}'
 
     # ===== FIX GEMINI AVEC RECHERCHE =====
     if p["name"] == "Gemini":
@@ -35,9 +32,10 @@ async def _call(p, prompt, enable_search=False):
             "contents": [{"parts": parts}],
             "generationConfig": {"responseMimeType": "application/json"}
         }
-        # ON AJOUTE L'OUTIL DE RECHERCHE SI DEMANDÉ
+        # FORMAT OFFICIEL GOOGLE POUR SEARCH
         if enable_search and p.get("search"):
-            payload["tools"] = [{"google_search": {}}]
+            payload["tools"] = [{"google_search_retrieval": {}}] # <-- C'ETAIT ÇA LE BUG
+
     else:
         payload = {
             "model": p["model"],
@@ -48,14 +46,17 @@ async def _call(p, prompt, enable_search=False):
             "response_format": {"type": "json_object"}
         }
 
+    print(f"[ROUTER] Payload envoyé à {p['name']}: search={enable_search}") # LOG
+
     async with httpx.AsyncClient(timeout=20.0) as c:
         r = await c.post(p["url"], headers=headers, json=payload)
+        if r.status_code!= 200:
+            print(f"[ROUTER] ERREUR {p['name']}: {r.text}") # LOG ERREUR COMPLETE
         r.raise_for_status()
         data = r.json()
 
         if p["name"] == "Gemini":
             text = data["candidates"][0]["content"]["parts"][0]["text"]
-            # ON RÉCUPÈRE LES SOURCES
             sources = []
             if "groundingMetadata" in data["candidates"][0]:
                 for s in data["candidates"][0]["groundingMetadata"].get("groundingChunks", []):
@@ -67,24 +68,26 @@ async def _call(p, prompt, enable_search=False):
             text = data["choices"][0]["message"]["content"]
             return _clean_json(text)
 
-async def ask_ai(prompt, enable_search=False): # AJOUT PARAM
+async def ask_ai(prompt, enable_search=False):
     last_error = ""
     for p in PROVIDERS:
         try:
-            print(f"[ROUTER] {p['name']} Search={enable_search}")
-            # SI C'EST UNE QUESTION QUI NÉCESSITE LA RECHERCHE, ON FORCE GEMINI
-            needs_search = any(k in prompt.lower() for k in ["actu", "météo", "prix", "cours", "aujourd'hui", "maintenant", "google", "recherche"])
+            needs_search = any(k in prompt.lower() for k in ["actu", "météo", "prix", "cours", "aujourd'hui", "maintenant", "google", "recherche", "temps"])
+
+            # SI BESOIN DE RECHERCHE ON FORCE GEMINI DIRECT
+            if needs_search and p["name"]!= "Gemini":
+                continue
+
             use_search = enable_search or needs_search
-
-            if use_search and p["name"]!= "Gemini":
-                continue # On skip Groq/Deepseek si on a besoin de search
-
+            print(f"[ROUTER] Tentative {p['name']} search={use_search}")
             result = await _call(p, prompt, enable_search=use_search)
             return result
         except Exception as e:
             print(f"[ROUTER] {p['name']} KO: {e}")
             last_error = str(e)
-    return {"text": f"Erreur IA: {last_error[:50]}. Réessaie.", "self": {}, "sources": []}
+
+    # FALLBACK SI TOUT PLANTE
+    return {"text": f"Désolée Yamine, j'ai eu un bug réseau. Réessaie.", "self": {}, "sources": []}
 
 # TTS reste identique
 from fastapi import APIRouter, Request
