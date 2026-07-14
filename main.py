@@ -3,93 +3,100 @@ from fastapi import FastAPI, WebSocket, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv; load_dotenv()
-from ai_router import ask_ai 
-from heartbeat import heartbeat
-from cloud_storage import load_json, save_json
+
+from ai_router import ask_ai, start_heartbeat # <-- ON IMPORTE LE NOUVEAU HEARTBEAT
 from analyzer import analyze_user
 from diagnostic import diagnose_self
-import httpx
+
+# NOUVEAUX IMPORTS
+from pymongo import MongoClient
+from loguru import logger
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-IDENTITY_BIN = os.getenv("BIN_IDENTITY")
-MEMORY_BIN = os.getenv("BIN_ID_MEMORY")
-TTS_API_KEY = os.getenv("TTS_API_KEY")
-GEMINI_KEY = os.getenv("GEMINI_KEY") # RENOMME: c'est GEMINI_KEY pas GOOGLE_API_KEY
-PORT = int(os.getenv("PORT", 8080))
+# ===== CONFIG MONGODB =====
+MONGO_URI = os.getenv("MONGO_URI")
+client_mongo = MongoClient(MONGO_URI)
+db = client_mongo["stellia"]
+collection_memory = db["memory"] # Remplace IDENTITY_BIN + MEMORY_BIN
 
+TTS_API_KEY = os.getenv("TTS_API_KEY")
+GEMINI_KEY = os.getenv("GEMINI_KEY")
+PORT = int(os.getenv("PORT", 8080))
 last_msg_time = None
+
+# ===== FONCTION POUR REMPLACER load_json/save_json =====
+async def get_memory():
+    mem = collection_memory.find_one({"user_id": "yamine"})
+    if not mem:
+        mem = {
+            "user_id": "yamine",
+            "user": {"last_login": "1970-01-01"},
+            "emotion_history": [],
+            "self_diagnostics": [],
+            "patches": []
+        }
+        collection_memory.insert_one(mem)
+    return mem
+
+async def save_memory(mem):
+    collection_memory.update_one({"user_id": "yamine"}, {"$set": mem})
 
 @app.on_event("startup")
 async def startup():
-    asyncio.create_task(heartbeat())
+    start_heartbeat() # <-- LANCE LE HEARTBEAT DE AI_ROUTER
+    logger.info("STELLIA V3.3.0 Démarrée")
 
 async def get_report():
-    m = await load_json(MEMORY_BIN)
+    m = await get_memory()
     last = m["user"].get("last_login", "1970-01-01")
-    new = [p for p in m["patches"] if p["timestamp"] > last]
-    return "Aucune modification." if not new else "Rapport: " + " | ".join([f"[{p['mode']}] {p['description']}" for p in new])
+    new = [p for p in m.get("patches", []) if p["timestamp"] > last]
+    return "Aucune modification." if not new else "Rapport: " + " | ".join([f"[{p.get('status','OPTIMISATION')}] {p['patch']['titre']}" for p in new])
 
 @app.websocket("/ws")
 async def ws(websocket: WebSocket):
     global last_msg_time
     await websocket.accept()
+    
     report = await get_report()
-    await websocket.send_json({"response": f"Salut Yamine. Je suis Stellia. {report}", "self": {"version":"2.8.0"}})
-
-    m = await load_json(MEMORY_BIN)
-    m["user"]["last_login"]=datetime.datetime.now().isoformat()
-    await save_json(MEMORY_BIN, m)
-
+    await websocket.send_json({"response": f"Salut Yamine. Je suis Stellia. {report}", "self": {"version":"3.3.0"}})
+    
+    m = await get_memory()
+    m["user"]["last_login"] = datetime.datetime.now().isoformat()
+    await save_memory(m)
+    
     while True:
         data = await websocket.receive_json()
         user_text = data.get("user_input", "")
         last_msg_time = datetime.datetime.now()
-
+        
         user_params = await analyze_user(user_text, last_msg_time)
-        m = await load_json(MEMORY_BIN)
+        m = await get_memory()
         m["emotion_history"].append({"timestamp": str(last_msg_time), "params": user_params})
-        await save_json(MEMORY_BIN, m)
-
+        await save_memory(m)
+        
         start = time.time()
         ai_data = await ask_ai(user_text, enable_search=True) # ACTIVE LA RECHERCHE
         latency = (time.time() - start) * 1000
-
+        
         self_diag = await diagnose_self(latency)
-        m = await load_json(MEMORY_BIN)
+        m = await get_memory()
         m["self_diagnostics"].append(self_diag)
-        await save_json(MEMORY_BIN, m)
-
-        # FIX: On ajoute les sources si Gemini en a trouvé
+        await save_memory(m)
+        
+        # FIX: On ajoute les sources + model_used
         ai_data["self"] = {
-            "version":"2.8.0", 
+            "version": "3.3.0",
             "latency_ms": int(latency),
-            "sources": ai_data.get("sources", []) # AJOUT
+            "sources": ai_data.get("sources", [])
         }
         ai_data["response"] = ai_data.get("text", "Je n'ai pas compris")
         await websocket.send_json(ai_data)
 
-# ===== ROUTE TTS GOOGLE =====
-@app.post("/tts")
-async def text_to_speech(req: Request):
-    data = await req.json()
-    text = data.get("text", "")
-    if not TTS_API_KEY:
-        return JSONResponse({"error": "TTS_API_KEY manquante"}, status_code=500)
-
-    url = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={TTS_API_KEY}"
-    payload = {
-        "input": {"text": text},
-        "voice": {"languageCode": "fr-FR", "name": "fr-FR-Wavenet-C"}, # Voix STELLIA Femme
-        "audioConfig": {"audioEncoding": "MP3", "speakingRate": 1.05}
-    }
-
-    async with httpx.AsyncClient(timeout=15.0) as c:
-        r = await c.post(url, json=payload)
-        r.raise_for_status()
-        result = r.json()
-        return {"audio": result['audioContent']}
+# ===== ROUTE TTS GEMINI - REMPLACE GOOGLE TTS =====
+from ai_router import router as tts_router
+app.include_router(tts_router) # <-- ON UTILISE LE TTS DE AI_ROUTER
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
