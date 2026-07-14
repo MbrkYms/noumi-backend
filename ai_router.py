@@ -1,10 +1,11 @@
-import httpx, json, re, os
+import httpx, json, re, os, base64
 from google import genai
+from google.genai import types # <-- AJOUTÉ
 
 GEMINI_KEY = os.getenv("GEMINI_KEY")
 DEEPSEEK_KEY = os.getenv("DEEPSEEK_KEY")
 GROQ_KEY = os.getenv("GROQ_KEY")
-TTS_API_KEY = os.getenv("TTS_API_KEY")
+TTS_API_KEY = os.getenv("TTS_API_KEY") # On peut le virer mais je le laisse
 
 # CLIENT GEMINI NOUVEAU SDK
 client = genai.Client(api_key=GEMINI_KEY)
@@ -24,29 +25,27 @@ def _clean_json(text):
 
 async def _call_gemini(prompt, enable_search=False):
     system_instruction = 'Tu es STELLIA, l\'IA personnelle de Yamine. Si tu utilises internet, cite tes sources. Réponds TOUJOURS en JSON: {"text": "ta réponse", "self": {}, "sources": []}'
+    full_prompt = system_instruction + "\n\nQuestion: " + prompt
 
-    generation_config = {
-        "response_mime_type": "application/json",
-        "thinking_level": "low",
-        "temperature": 0.9
-    }
-
+    tools = []
     if enable_search:
-        generation_config["tools"] = [{"google_search": {}}]
+        tools = [types.Tool(google_search=types.GoogleSearch())] # <-- FORMAT CORRECT
 
-    interaction = client.interactions.create(
+    response = client.models.generate_content(
         model="gemini-2.5-flash", # <-- TON MODÈLE STABLE
-        system_instruction=system_instruction,
-        input=prompt,
-        generation_config=generation_config
+        contents=full_prompt,
+        config=types.GenerateContentConfig(
+            tools=tools,
+            response_mime_type="application/json",
+            temperature=0.9
+        )
     )
 
-    text = interaction.output_text
+    text = response.text
     sources = []
-
     # RECUP SOURCES GOOGLE SEARCH
-    if hasattr(interaction, 'grounding_metadata') and interaction.grounding_metadata:
-        for chunk in interaction.grounding_metadata.grounding_chunks:
+    if response.candidates and response.candidates[0].grounding_metadata:
+        for chunk in response.candidates[0].grounding_metadata.grounding_chunks:
             if chunk.web:
                 sources.append(chunk.web.uri)
 
@@ -94,7 +93,7 @@ async def ask_ai(prompt, enable_search=False):
                 last_error = str(e)
         return {"text": f"Bug: {last_error[:100]}", "self": {}, "sources": []}
 
-# TTS
+# TTS GEMINI
 from fastapi import APIRouter, Request
 router = APIRouter()
 
@@ -102,16 +101,29 @@ router = APIRouter()
 async def text_to_speech(req: Request):
     data = await req.json()
     text = data.get("text", "")
-    if not TTS_API_KEY:
-        return {"error": "TTS_API_KEY manquante"}
-    url = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={TTS_API_KEY}"
-    payload = {
-        "input": {"text": text},
-        "voice": {"languageCode": "fr-FR", "name": "fr-FR-Wavenet-C"},
-        "audioConfig": {"audioEncoding": "MP3", "speakingRate": 1.05}
-    }
-    async with httpx.AsyncClient(timeout=15.0) as c:
-        r = await c.post(url, json=payload)
-        r.raise_for_status()
-        result = r.json()
-        return {"audio": result['audioContent']}
+
+    # PROMPT PERSONA STELLIA AVEC TAGS
+    prompt_tts = f"""# AUDIO PROFILE: Stellia
+## THE SCENE: Appel vocal privé avec Yamine
+### DIRECTOR'S NOTES
+Style: Voix féminine française, chaleureuse, avec le sourire. Rythme naturel.
+#### TRANSCRIPT
+[text]"""
+
+    response = client.models.generate_content(
+        model="gemini-2.5-flash-tts-preview", # <-- TTS GEMINI
+        contents=prompt_tts.replace("[text]", text),
+        config=types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Kore") # Voix chaleureuse
+                )
+            )
+        )
+    )
+
+    # Récupération de l'audio
+    audio_data = response.candidates[0].content.parts[0].inline_data.data
+    audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+    return {"audio": audio_base64}
