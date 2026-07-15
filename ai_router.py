@@ -1,4 +1,4 @@
-import httpx, json, re, os, base64, asyncio, subprocess, shutil, sys, psutil
+import httpx, json, re, os, base64, asyncio, subprocess, shutil, sys, psutil, uuid
 from datetime import datetime
 from google import genai
 from google.genai import types
@@ -15,6 +15,8 @@ from telegram import Bot
 # ===== CONFIG =====
 MONGO_URI = os.getenv("MONGO_URI")
 MASTER_PASSWORD = "LUCIOLE" # MOT DE PASSE POUR MODE PERSONNEL
+SESSIONS = {} # N°2: Stocke les sessions Web {session_id: user_id}
+
 if MONGO_URI:
     client_mongo = MongoClient(MONGO_URI, maxPoolSize=10)
     db = client_mongo["stellia"]
@@ -223,17 +225,12 @@ async def handle_command(user_id: str, command: str):
     parts = command.split(" ", 1)
     cmd = parts[0].lower()
     args = parts[1] if len(parts) > 1 else ""
-
     if cmd == "/help": return {"text": COMMAND_LIST}
     if cmd == "luciole":
         if await authenticate_user(user_id, args if args else "LUCIOLE"):
-            return {"text": "Authentification réussie Monsieur. Mode personnel activé. " + COMMAND_LIST}
-        else: return {"text": "Mot de passe incorrect."}
-
-    # Bloque les commandes si pas authentifié
-    if not await is_authenticated(user_id):
-        return {"text": "Accès refusé. Veuillez taper `LUCIOLE` pour vous authentifier."}
-
+            return {"text": "Authentification réussie Monsieur. Mode personnel activé. " + COMMAND_LIST, "auth": True}
+        else: return {"text": "Mot de passe incorrect.", "auth": False}
+    if not await is_authenticated(user_id): return {"text": "Accès refusé. Veuillez taper `LUCIOLE` pour vous authentifier.", "auth_required": True}
     if cmd == "/deploy": return await deploy_railway()
     if cmd == "/status": return await get_status()
     if cmd == "/memory": return {"memory": await search_memory(user_id, "", 5)}
@@ -241,20 +238,16 @@ async def handle_command(user_id: str, command: str):
     return None
 
 async def ask_ai(user_id: str, prompt, enable_search=False):
-    # Si pas auth, on ne donne que la mémoire publique
     if not await is_authenticated(user_id) and not prompt.upper().startswith("LUCIOLE"):
-        return {"text": "Bonjour. Pour accéder au mode personnel, veuillez taper: `LUCIOLE`", "model_used": "Garde", "sources": []}
-
+        return {"text": "Bonjour. Pour accéder au mode personnel, veuillez taper: `LUCIOLE`", "model_used": "Garde", "sources": [], "auth_required": True}
     if prompt.startswith("/"):
         cmd_result = await handle_command(user_id, prompt)
-        if cmd_result: return {"text": str(cmd_result.get("text", cmd_result)), "model_used": "Commande Directe", "sources": []}
-
+        if cmd_result: return {"text": str(cmd_result.get("text", cmd_result)), "model_used": "Commande Directe", "sources": [], "auth": cmd_result.get("auth")}
     rag_context = await search_memory(user_id, prompt)
     final_prompt = f"CONTEXTE PASSÉ:\n{rag_context}\n\nQUESTION: {prompt}" if rag_context else prompt
     needs_search = any(k in final_prompt.lower() for k in ["actu", "météo", "prix", "cours", "aujourd'hui", "maintenant", "google", "recherche", "news"])
     result = None
     providers_to_try = select_provider(final_prompt)
-
     if needs_search and GEMINI_KEYS:
         for i, key in enumerate(GEMINI_KEYS):
             try: result = await _call_gemini_with_key(key, i+1, final_prompt, enable_search=True); break
@@ -275,9 +268,7 @@ async def ask_ai(user_id: str, prompt, enable_search=False):
 async def telegram_polling():
     if not telegram_bot: return
     offset = None
-    # Envoie la liste des commandes au démarrage
     await send_telegram("STELLIA en ligne. Tapez `LUCIOLE` pour vous connecter.\n" + COMMAND_LIST)
-
     while True:
         try:
             updates = await telegram_bot.get_updates(offset=offset, timeout=10)
@@ -329,14 +320,32 @@ def start_heartbeat():
     asyncio.create_task(telegram_polling())
     logger.info("[HEARTBEAT] Scheduler lancé: toutes les 30 minutes + Polling Telegram actif")
 
-# ===== ROUTE TTS =====
+# ===== ROUTES API V3.7.3 =====
 router = APIRouter()
+
+@router.post("/auth") # NOUVEAU: Pour le Web ia.webarki.fr
+async def web_auth(req: Request):
+    data = await req.json()
+    password = data.get("password", "")
+    session_id = str(uuid.uuid4())
+    user_id = f"web_{session_id}"
+
+    if await authenticate_user(user_id, password):
+        SESSIONS[session_id] = user_id
+        logger.success(f"[AUTH WEB] Session créée: {session_id}")
+        return {"status": "success", "session_id": session_id, "message": "Authentifié"}
+    return {"status": "error", "message": "Mot de passe incorrect"}
 
 @router.post("/tts")
 async def text_to_speech(req: Request):
     data = await req.json()
     text = data.get("text", "")
+    session_id = data.get("session_id") # Récupère session web
+    user_id = SESSIONS.get(session_id, "guest")
+
+    if not await is_authenticated(user_id): return {"error": "Auth requise. Connectez-vous avec LUCIOLE d'abord."}
     if not GEMINI_KEYS: return {"error": "Aucune GEMINI_KEY"}
+
     client = genai.Client(api_key=GEMINI_KEYS[0])
     try:
         response = client.models.generate_content(
