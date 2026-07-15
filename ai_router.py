@@ -16,6 +16,7 @@ from telegram import Bot
 MONGO_URI = os.getenv("MONGO_URI")
 MASTER_PASSWORD = "LUCIOLE" # MOT DE PASSE POUR MODE PERSONNEL
 SESSIONS = {} # N°2: Stocke les sessions Web {session_id: user_id}
+HF_TOKEN = os.getenv("HF_TOKEN") # FIX: Pour BGE
 
 if MONGO_URI:
     client_mongo = MongoClient(MONGO_URI, maxPoolSize=10)
@@ -31,8 +32,8 @@ else:
     logger.warning("[MONGO] MONGO_URI manquant. Mode sans BDD")
 
 scheduler = AsyncIOScheduler()
-# V3.7.4: OPTIM EMBEDDING -> BGE-SMALL
-embed_model = SentenceTransformer('BAAI/bge-small-en-v1.5')
+# V3.7.6: OPTIM EMBEDDING -> BGE-SMALL + HF_TOKEN
+embed_model = SentenceTransformer('BAAI/bge-small-en-v1.5', token=HF_TOKEN if HF_TOKEN else None)
 logger.success("[EMBEDDING] Modèle BGE-Small chargé")
 
 # ===== CLÉS =====
@@ -124,7 +125,7 @@ async def get_status():
 TOOLS = {"deploy_railway": deploy_railway, "create_file": create_file, "read_file": read_file, "run_command": run_command, "send_telegram": send_telegram, "get_status": get_status}
 TOOL_DESCRIPTIONS = """Tu as accès à ces outils: 1. deploy_railway 2. create_file 3. read_file 4. run_command 5. send_telegram 6. get_status"""
 
-# ===== RAG MEMOIRE MULTI-USER V3.7.4 BGE =====
+# ===== RAG MEMOIRE MULTI-USER V3.7.6 BGE =====
 async def save_conversation_to_rag(user_id: str, user_msg: str, ai_msg: str):
     if collection_memory is None: return
     text = f"User: {user_msg}\nSTELLIA: {ai_msg}"
@@ -190,7 +191,7 @@ async def apply_patch(patch: dict):
         logger.error(f"[AUTO-PATCH] ÉCHEC: {e}. Restauration...")
         shutil.copy(backup_file, fichier_cible)
 
-# ===== ROUTER IA V3.7.4 SMART =====
+# ===== ROUTER IA V3.7.6 SMART + FALLBACK =====
 def select_provider(prompt: str, enable_search: bool):
     prompt_lower = prompt.lower()
     prompt_len = len(prompt)
@@ -204,7 +205,7 @@ def select_provider(prompt: str, enable_search: bool):
     # Règle 4: Prompt Court/Simple = Groq
     return [p for p in PROVIDERS if p["name"] == "Groq"] + [{"name": "Gemini", "key": GEMINI_KEYS[0] if GEMINI_KEYS else None}]
 
-@retry(stop=stop_after_attempt(3))
+@retry(stop=stop_after_attempt(2))
 async def _call_gemini_with_key(api_key, key_index, prompt, enable_search=False):
     client = genai.Client(api_key=api_key)
     identity = await load_identity()
@@ -220,13 +221,13 @@ async def _call_gemini_with_key(api_key, key_index, prompt, enable_search=False)
     result["model_used"] = f"Gemini-2.5-Flash [Clé {key_index}]"
     return result
 
-@retry(stop=stop_after_attempt(3))
+@retry(stop=stop_after_attempt(2))
 async def _call_rest(p, prompt):
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {p['key']}"}
     identity = await load_identity()
     system_prompt = f"Tu es {identity['name']}, l'IA personnelle de {identity['owner']}. Personnalité: {identity['personality']}."
     payload = {"model": p["model"], "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
-    async with httpx.AsyncClient(timeout=25.0) as c:
+    async with httpx.AsyncClient(timeout=15.0) as c:
         r = await c.post(p["url"], headers=headers, json=payload)
         r.raise_for_status()
         result = _clean_json(r.json()["choices"][0]["message"]["content"])
@@ -250,7 +251,7 @@ async def handle_command(user_id: str, command: str):
     return None
 
 async def ask_ai(user_id: str, prompt, enable_search=False):
-    # FIX N°2: Check si prompt est None
+    # FIX: Check si prompt est None
     if not prompt: return {"text": "Je n'ai rien reçu Monsieur.", "model_used": "Garde"}
 
     if not await is_authenticated(user_id) and not prompt.upper().startswith("LUCIOLE"):
@@ -261,15 +262,21 @@ async def ask_ai(user_id: str, prompt, enable_search=False):
     rag_context = await search_memory(user_id, prompt)
     final_prompt = f"CONTEXTE PASSÉ:\n{rag_context}\n\nQUESTION: {prompt}" if rag_context else prompt
     result = None
-    providers_to_try = select_provider(final_prompt, enable_search) # V3.7.4: Smart Router
-    for p in providers_to_try:
+    providers_to_try = select_provider(final_prompt, enable_search) # V3.7.6: Smart Router
+
+    for p in providers_to_try: # FIX: Fallback propre
         if not p.get("key"): continue
         try:
             if p["name"] == "Gemini": result = await _call_gemini_with_key(p["key"], 1, final_prompt, enable_search)
             else: result = await _call_rest(p, final_prompt)
             break
-        except Exception as e: logger.warning(f"[ROUTER] {p['name']} failed: {e}"); continue
-    if result is None: result = {"text": "Toutes les IA sont down", "self": {}, "sources": [], "model_used": "Aucun"}
+        except Exception as e:
+            logger.warning(f"[ROUTER] {p['name']} failed: {type(e).__name__}");
+            continue
+
+    if result is None: # Si tout est down
+        result = {"text": "Toutes les IA sont momentanément indisponibles. Réessayez dans 30s.", "self": {}, "sources": [], "model_used": "Aucun"}
+
     await save_conversation_to_rag(user_id, prompt, result["text"])
     return result
 
@@ -277,13 +284,13 @@ async def ask_ai(user_id: str, prompt, enable_search=False):
 async def telegram_polling():
     if not telegram_bot: return
     offset = None
-    await send_telegram("STELLIA V3.7.5 en ligne. Bug fix appliqué.\nTapez `LUCIOLE` pour vous connecter.\n" + COMMAND_LIST)
+    await send_telegram("STELLIA V3.7.6 en ligne. Fallback + HF fixés.\nTapez `LUCIOLE` pour vous connecter.\n" + COMMAND_LIST)
     while True:
         try:
             updates = await telegram_bot.get_updates(offset=offset, timeout=10)
             for update in updates:
                 if update.message and str(update.message.chat_id) == TELEGRAM_CHAT_ID:
-                    user_text = update.message.text # FIX N°1: Peut être None
+                    user_text = update.message.text # FIX: Peut être None
                     if not user_text: # Ignore les photos/stickers/vocaux
                         logger.warning("[TELEGRAM] Message sans texte reçu. Ignoré.")
                         offset = update.update_id + 1
@@ -334,7 +341,7 @@ def start_heartbeat():
     asyncio.create_task(telegram_polling())
     logger.info("[HEARTBEAT] Scheduler lancé: toutes les 30 minutes + Polling Telegram actif")
 
-# ===== ROUTES API V3.7.5 =====
+# ===== ROUTES API V3.7.6 =====
 router = APIRouter()
 
 @router.post("/auth")
