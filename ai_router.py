@@ -59,7 +59,7 @@ async def send_telegram(message: str):
     """Envoie une notif Telegram proactive à Monsieur"""
     if not telegram_bot or not TELEGRAM_CHAT_ID: return {"status": "error", "message": "Config manquante"}
     try:
-        await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🔔 *JARVIS*\n\n{message}", parse_mode='Markdown')
+        await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🔔 *STELLIA*\n\n{message}", parse_mode='Markdown')
         logger.success(f"[TELEGRAM] Notif envoyée")
         return {"status": "success"}
     except Exception as e: return {"status": "error", "message": str(e)}
@@ -108,7 +108,7 @@ Quand tu veux utiliser un outil, réponds en JSON: {"tool": "nom_outil", "params
 # ===== RAG MEMOIRE OPTI =====
 async def save_conversation_to_rag(user_msg: str, ai_msg: str):
     if collection_memory is None: return
-    text = f"User: {user_msg}\nJARVIS: {ai_msg}"
+    text = f"User: {user_msg}\STELLIA: {ai_msg}"
     embedding = embed_model.encode(text).tolist()
     collection_memory.insert_one({"timestamp": datetime.utcnow(), "text": text, "embedding": embedding})
     # OPTI: Garde seulement les 1000 derniers
@@ -137,7 +137,7 @@ async def load_identity() -> dict:
     if collection_identity is None: return {}
     doc = collection_identity.find_one({"_id": "main"})
     if doc: return doc.get("data", {})
-    default_identity = {"name": "JARVIS", "owner": "Yamine", "personality": "Majordome IA britannique, extrêmement poli, efficace et discret. Appelle Yamine 'Monsieur'. Réponds en 2-3 phrases max.", "goals": ["Assister Monsieur Yamine"], "created_at": datetime.utcnow().isoformat()}
+    default_identity = {"name": "STELLIA", "owner": "Yamine", "personality": "Majordome IA britannique, extrêmement poli, efficace et discret. Appelle Yamine 'Monsieur'. Réponds en 2-3 phrases max.", "goals": ["Assister Monsieur Yamine"], "created_at": datetime.utcnow().isoformat()}
     await save_identity(default_identity)
     return default_identity
 
@@ -232,13 +232,13 @@ async def ask_ai(prompt, enable_search=False):
 # ===== HEARTBEAT FULL AUTO + RAPPORT TELEGRAM =====
 async def generate_diagnostic() -> dict:
     if not GEMINI_KEYS: return {"etat": "ERREUR", "optimisations": []}
-    prompt = """Tu es JARVIS. Fais un diagnostic. Propose 2 optimisations concrètes en code python. Réponds en JSON: {"etat": "OK", "optimisations": ["Ajouter un cache LRU"]}"""
+    prompt = """Tu es STELLIA. Fais un diagnostic. Propose 2 optimisations concrètes en code python. Réponds en JSON: {"etat": "OK", "optimisations": ["Ajouter un cache LRU"]}"""
     return await _call_gemini_with_key(GEMINI_KEYS[0], 1, prompt)
 
 async def generate_patches(diagnostic: dict) -> list:
     if not GEMINI_KEYS: return []
     points = ", ".join(diagnostic.get("optimisations", []))
-    prompt = f"""Basé sur: {points}. Propose 2 patchs de code python pour JARVIS. Format JSON: {{"patches": [{{"titre": "...", "description": "...", "code": "def ma_fonction(): pass"}}]}}"""
+    prompt = f"""Basé sur: {points}. Propose 2 patchs de code python pour STELLIA. Format JSON: {{"patches": [{{"titre": "...", "description": "...", "code": "def ma_fonction(): pass"}}]}}"""
     result = await _call_gemini_with_key(GEMINI_KEYS[0], 1, prompt)
     return result.get("patches", [])
 

@@ -47,7 +47,7 @@ async def startup():
     start_heartbeat() # Lance le heartbeat de ai_router
     identity = await load_identity()
     await send_telegram("STELLIA V3.6.0 Démarrée. Systèmes en ligne.") # NOTIF TELEGRAM
-    logger.info(f"STELLIA V3.6.0 Démarrée. Identité: {identity.get('name', 'JARVIS')}")
+    logger.info(f"STELLIA V3.6.0 Démarrée. Identité: {identity.get('name', 'STELLIA')}")
 
 async def get_report():
     m = await get_memory()
@@ -60,10 +60,10 @@ async def ws(websocket: WebSocket):
     global last_msg_time
     await websocket.accept()
     identity = await load_identity()
-    name = identity.get("name", "JARVIS")
+    name = identity.get("name", "STELLIA")
     report = await get_report()
     await websocket.send_json({
-        "response": f"Bonjour Monsieur. Je suis {name}. {report}", # MODE JARVIS
+        "response": f"Bonjour Monsieur. Je suis {name}. {report}",
         "self": {"version":"3.6.0", "identity": identity}
     })
     m = await get_memory()
