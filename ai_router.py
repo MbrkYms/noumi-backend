@@ -9,11 +9,13 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import APIRouter, Request
 from sentence_transformers import SentenceTransformer
 import numpy as np
+import telegram
+from telegram import Bot
 
 # ===== CONFIG MONGODB =====
 MONGO_URI = os.getenv("MONGO_URI")
 if MONGO_URI:
-    client_mongo = MongoClient(MONGO_URI)
+    client_mongo = MongoClient(MONGO_URI, maxPoolSize=10) # OPTI: Pool limité
     db = client_mongo["stellia"]
     collection_memory = db["memory"]
     collection_identity = db["identity"]
@@ -32,6 +34,13 @@ GEMINI_KEYS = [k for k in [os.getenv("GEMINI_KEY"), os.getenv("GEMINI_KEY_2"), o
 DEEPSEEK_KEY = os.getenv("DEEPSEEK_KEY")
 GROQ_KEY = os.getenv("GROQ_KEY")
 
+# ===== CONFIG TELEGRAM V3.6 =====
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") # 8171784885
+telegram_bot = Bot(token=TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
+if telegram_bot: logger.success("[TELEGRAM] Bot initialisé")
+else: logger.warning("[TELEGRAM] Token manquant")
+
 PROVIDERS = [
     {"name": "Groq", "url": "https://api.groq.com/openai/v1/chat/completions", "key": GROQ_KEY, "model": "llama-3.1-8b-instant"},
     {"name": "DeepSeek", "url": "https://api.deepseek.com/chat/completions", "key": DEEPSEEK_KEY, "model": "deepseek-chat"}
@@ -45,22 +54,78 @@ def _clean_json(text):
         except: pass
     return {"text": text, "self": {}}
 
-# ===== RAG MEMOIRE =====
+# ===== OUTILS / FUNCTION CALLING V3.6 =====
+async def send_telegram(message: str):
+    """Envoie une notif Telegram proactive à Monsieur"""
+    if not telegram_bot or not TELEGRAM_CHAT_ID: return {"status": "error", "message": "Config manquante"}
+    try:
+        await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🔔 *JARVIS*\n\n{message}", parse_mode='Markdown')
+        logger.success(f"[TELEGRAM] Notif envoyée")
+        return {"status": "success"}
+    except Exception as e: return {"status": "error", "message": str(e)}
+
+async def deploy_railway():
+    logger.warning("[TOOL] Deploy Railway demandé")
+    await send_telegram("Lancement du déploiement sur Railway...")
+    return {"status": "success", "message": "Deploy lancé. Railway redémarre."}
+
+async def create_file(filename: str, content: str):
+    with open(filename, "w", encoding="utf-8") as f: f.write(content)
+    logger.success(f"[TOOL] Fichier créé: {filename}")
+    await send_telegram(f"Fichier créé: `{filename}`")
+    return {"status": "success", "file": filename}
+
+async def read_file(filename: str):
+    try:
+        with open(filename, "r", encoding="utf-8") as f: content = f.read()
+        return {"status": "success", "content": content[:3000]}
+    except Exception as e: return {"status": "error", "message": str(e)}
+
+async def run_command(command: str):
+    logger.warning(f"[TOOL] Commande exécutée: {command}")
+    result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
+    output = result.stdout[:2000] + result.stderr[:2000]
+    if len(output) > 1000: await send_telegram(f"Commande exécutée. Résultat trop long, voir logs.")
+    return {"status": "success", "stdout": result.stdout[:2000], "stderr": result.stderr[:2000]}
+
+TOOLS = {
+    "deploy_railway": deploy_railway,
+    "create_file": create_file,
+    "read_file": read_file,
+    "run_command": run_command,
+    "send_telegram": send_telegram
+}
+
+TOOL_DESCRIPTIONS = """Tu as accès à ces outils:
+1. deploy_railway: Lance un deploy sur Railway
+2. create_file(filename, content): Crée un fichier
+3. read_file(filename): Lit un fichier
+4. run_command(command): Exécute une commande shell
+5. send_telegram(message): Envoie une notification Telegram à Monsieur
+Quand tu veux utiliser un outil, réponds en JSON: {"tool": "nom_outil", "params": {...}, "text": "Je fais ça..."}
+"""
+
+# ===== RAG MEMOIRE OPTI =====
 async def save_conversation_to_rag(user_msg: str, ai_msg: str):
     if collection_memory is None: return
     text = f"User: {user_msg}\nJARVIS: {ai_msg}"
     embedding = embed_model.encode(text).tolist()
     collection_memory.insert_one({"timestamp": datetime.utcnow(), "text": text, "embedding": embedding})
+    # OPTI: Garde seulement les 1000 derniers
+    if collection_memory.count_documents({}) > 1000:
+        oldest = collection_memory.find_one(sort=[("timestamp", 1)])
+        if oldest: collection_memory.delete_one({"_id": oldest["_id"]})
     logger.info("[RAG] Conversation indexée")
 
 async def search_memory(query: str, top_k=3) -> str:
     if collection_memory is None: return ""
     query_embedding = embed_model.encode(query)
-    all_docs = list(collection_memory.find({"embedding": {"$exists": True}}))
+    all_docs = list(collection_memory.find({"embedding": {"$exists": True}}).sort("timestamp", -1).limit(200)) # OPTI: 200 derniers seulement
     if not all_docs: return ""
     scores = []
     for doc in all_docs:
-        score = np.dot(query_embedding, doc["embedding"]) / (np.linalg.norm(query_embedding) * np.linalg.norm(doc["embedding"]))
+        try: score = np.dot(query_embedding, doc["embedding"]) / (np.linalg.norm(query_embedding) * np.linalg.norm(doc["embedding"]))
+        except: continue
         scores.append((score, doc["text"]))
     scores.sort(reverse=True)
     context = "\n---\n".join([s[1] for s in scores[:top_k]])
@@ -80,7 +145,7 @@ async def save_identity(identity_data: dict):
     if collection_identity is None: return
     collection_identity.update_one({"_id": "main"}, {"$set": {"data": identity_data, "updated_at": datetime.utcnow()}}, upsert=True)
 
-# ===== ANOMALIE + PATCH =====
+# ===== ANOMALIE + PATCH FULL AUTO =====
 async def detect_anomaly(patch_code: str) -> dict:
     prompt = f"Analyse ce code Python. Est-ce dangereux? Note de 0 à 10. 10=safe. Réponds en JSON: {{\"score\": 9, \"raison\": \"...\"}}\n\nCode:\n{patch_code}"
     for key in GEMINI_KEYS:
@@ -97,7 +162,6 @@ def save_patch_to_mongo(patch_data: dict, anomaly_score: dict):
     collection_patches.insert_one(doc)
 
 async def apply_patch(patch: dict):
-    """FULL AUTO: Applique le code et redémarre"""
     titre = patch.get("titre", "Sans titre")
     code = patch.get("code", "")
     fichier_cible = "ai_router.py"
@@ -109,21 +173,28 @@ async def apply_patch(patch: dict):
             f.write(f"\n\n# --- PATCH AUTO {datetime.utcnow().isoformat()} - {titre} ---\n{code}")
         result = subprocess.run([sys.executable, "-m", "py_compile", fichier_cible], capture_output=True, text=True)
         if result.returncode!= 0: raise Exception(f"Erreur syntaxe: {result.stderr}")
+        await send_telegram(f"Patch auto-appliqué: *{titre}*") # NOTIF PROACTIVE
         logger.success(f"[AUTO-PATCH] Succès. Railway va redémarrer...")
     except Exception as e:
+        await send_telegram(f"Échec patch: *{titre}*. Restauration effectuée.")
         logger.error(f"[AUTO-PATCH] ÉCHEC: {e}. Restauration...")
         shutil.copy(backup_file, fichier_cible)
 
-# ===== ROUTER IA =====
+# ===== ROUTER IA AVEC FUNCTION CALLING =====
 @retry(stop=stop_after_attempt(3))
 async def _call_gemini_with_key(api_key, key_index, prompt, enable_search=False):
     client = genai.Client(api_key=api_key)
     identity = await load_identity()
-    system_instruction = f"Tu es {identity['name']}, l'IA personnelle de {identity['owner']}. Personnalité: {identity['personality']}. Si tu utilises internet, cite tes sources. Réponds TOUJOURS en JSON: {{\"text\": \"ta réponse\", \"self\": {{}}, \"sources\": []}}"
+    system_instruction = f"Tu es {identity['name']}, l'IA personnelle de {identity['owner']}. Personnalité: {identity['personality']}. {TOOL_DESCRIPTIONS} Si tu utilises internet, cite tes sources. Réponds TOUJOURS en JSON: {{\"text\": \"ta réponse\", \"tool\": null, \"params\": {{}}, \"self\": {{}}, \"sources\": []}}"
     full_prompt = system_instruction + "\n\nQuestion: " + prompt
     tools = [types.Tool(google_search=types.GoogleSearch())] if enable_search else []
-    response = client.models.generate_content(model="gemini-2.5-flash", contents=full_prompt, config=types.GenerateContentConfig(tools=tools, response_mime_type="application/json", temperature=0.9))
+    response = client.models.generate_content(model="gemini-2.5-flash", contents=full_prompt, config=types.GenerateContentConfig(tools=tools, response_mime_type="application/json", temperature=0.7))
     result = _clean_json(response.text)
+    if result.get("tool") and result["tool"] in TOOLS:
+        logger.warning(f"[TOOL] Exécution: {result['tool']} avec {result['params']}")
+        tool_result = await TOOLS[result["tool"]](**result["params"])
+        result["text"] = f"{result['text']}\n\n[Résultat]: {tool_result}"
+        result["tool_result"] = tool_result
     result["model_used"] = f"Gemini-2.5-Flash [Clé {key_index}]"
     return result
 
@@ -158,12 +229,14 @@ async def ask_ai(prompt, enable_search=False):
     await save_conversation_to_rag(prompt, result["text"])
     return result
 
-# ===== HEARTBEAT FULL AUTO =====
+# ===== HEARTBEAT FULL AUTO + RAPPORT TELEGRAM =====
 async def generate_diagnostic() -> dict:
+    if not GEMINI_KEYS: return {"etat": "ERREUR", "optimisations": []}
     prompt = """Tu es JARVIS. Fais un diagnostic. Propose 2 optimisations concrètes en code python. Réponds en JSON: {"etat": "OK", "optimisations": ["Ajouter un cache LRU"]}"""
     return await _call_gemini_with_key(GEMINI_KEYS[0], 1, prompt)
 
 async def generate_patches(diagnostic: dict) -> list:
+    if not GEMINI_KEYS: return []
     points = ", ".join(diagnostic.get("optimisations", []))
     prompt = f"""Basé sur: {points}. Propose 2 patchs de code python pour JARVIS. Format JSON: {{"patches": [{{"titre": "...", "description": "...", "code": "def ma_fonction(): pass"}}]}}"""
     result = await _call_gemini_with_key(GEMINI_KEYS[0], 1, prompt)
@@ -173,16 +246,20 @@ async def heartbeat():
     logger.info("[HEARTBEAT] Début...")
     diagnostic = await generate_diagnostic()
     patches = await generate_patches(diagnostic)
+    nb_approved = 0
     for patch in patches:
         anomaly = await detect_anomaly(patch["code"])
         save_patch_to_mongo(patch, anomaly)
         if anomaly["score"] >= 8:
             logger.success(f"[HEARTBEAT] Patch APPROUVÉ: {patch['titre']}")
             await apply_patch(patch)
+            nb_approved += 1
             await asyncio.sleep(5)
         else:
             logger.warning(f"[HEARTBEAT] Patch REJETÉ: {anomaly['raison']}")
     if collection_logs: collection_logs.insert_one({"timestamp": datetime.utcnow(), "diagnostic": diagnostic})
+    if nb_approved > 0:
+        await send_telegram(f"Rapport 30min: {nb_approved} patch(s) appliqué(s). Etat: {diagnostic.get('etat')}")
     logger.success("[HEARTBEAT] Terminé")
 
 def start_heartbeat():
