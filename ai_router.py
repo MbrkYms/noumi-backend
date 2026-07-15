@@ -38,8 +38,10 @@ GROQ_KEY = os.getenv("GROQ_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") # 8171784885
 telegram_bot = Bot(token=TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
-if telegram_bot: logger.success("[TELEGRAM] Bot initialisé")
-else: logger.warning("[TELEGRAM] Token manquant")
+if telegram_bot:
+    logger.success("[TELEGRAM] Bot initialisé")
+else:
+    logger.warning("[TELEGRAM] Token manquant")
 
 PROVIDERS = [
     {"name": "Groq", "url": "https://api.groq.com/openai/v1/chat/completions", "key": GROQ_KEY, "model": "llama-3.1-8b-instant"},
@@ -57,12 +59,14 @@ def _clean_json(text):
 # ===== OUTILS / FUNCTION CALLING V3.6 =====
 async def send_telegram(message: str):
     """Envoie une notif Telegram proactive à Monsieur"""
-    if not telegram_bot or not TELEGRAM_CHAT_ID: return {"status": "error", "message": "Config manquante"}
+    if not telegram_bot or not TELEGRAM_CHAT_ID:
+        return {"status": "error", "message": "Config manquante"}
     try:
         await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🔔 *STELLIA*\n\n{message}", parse_mode='Markdown')
         logger.success(f"[TELEGRAM] Notif envoyée")
         return {"status": "success"}
-    except Exception as e: return {"status": "error", "message": str(e)}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 async def deploy_railway():
     logger.warning("[TOOL] Deploy Railway demandé")
@@ -85,7 +89,8 @@ async def run_command(command: str):
     logger.warning(f"[TOOL] Commande exécutée: {command}")
     result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
     output = result.stdout[:2000] + result.stderr[:2000]
-    if len(output) > 1000: await send_telegram(f"Commande exécutée. Résultat trop long, voir logs.")
+    if len(output) > 1000:
+        await send_telegram(f"Commande exécutée. Résultat trop long, voir logs.")
     return {"status": "success", "stdout": result.stdout[:2000], "stderr": result.stderr[:2000]}
 
 TOOLS = {
@@ -102,13 +107,12 @@ TOOL_DESCRIPTIONS = """Tu as accès à ces outils:
 3. read_file(filename): Lit un fichier
 4. run_command(command): Exécute une commande shell
 5. send_telegram(message): Envoie une notification Telegram à Monsieur
-Quand tu veux utiliser un outil, réponds en JSON: {"tool": "nom_outil", "params": {...}, "text": "Je fais ça..."}
-"""
+Quand tu veux utiliser un outil, réponds en JSON: {"tool": "nom_outil", "params": {...}, "text": "Je fais ça..."}"""
 
 # ===== RAG MEMOIRE OPTI =====
 async def save_conversation_to_rag(user_msg: str, ai_msg: str):
     if collection_memory is None: return
-    text = f"User: {user_msg}\STELLIA: {ai_msg}"
+    text = f"User: {user_msg}\nSTELLIA: {ai_msg}"
     embedding = embed_model.encode(text).tolist()
     collection_memory.insert_one({"timestamp": datetime.utcnow(), "text": text, "embedding": embedding})
     # OPTI: Garde seulement les 1000 derniers
@@ -137,7 +141,12 @@ async def load_identity() -> dict:
     if collection_identity is None: return {}
     doc = collection_identity.find_one({"_id": "main"})
     if doc: return doc.get("data", {})
-    default_identity = {"name": "STELLIA", "owner": "Yamine", "personality": "Majordome IA britannique, extrêmement poli, efficace et discret. Appelle Yamine 'Monsieur'. Réponds en 2-3 phrases max.", "goals": ["Assister Monsieur Yamine"], "created_at": datetime.utcnow().isoformat()}
+    default_identity = {
+        "name": "STELLIA", "owner": "Yamine",
+        "personality": "Majordome IA britannique, extrêmement poli, efficace et discret. Appelle Yamine 'Monsieur'. Réponds en 2-3 phrases max.",
+        "goals": ["Assister Monsieur Yamine"],
+        "created_at": datetime.utcnow().isoformat()
+    }
     await save_identity(default_identity)
     return default_identity
 
@@ -220,12 +229,11 @@ async def ask_ai(prompt, enable_search=False):
         for i, key in enumerate(GEMINI_KEYS):
             try: result = await _call_gemini_with_key(key, i+1, final_prompt, enable_search=True); break
             except: continue
-        if result is None: result = {"text": "Désolé Monsieur, quota HS.", "self": {}, "sources": [], "model_used": "Aucun"}
-    else:
+    if result is None:
         for p in PROVIDERS:
             try: result = await _call_rest(p, final_prompt); break
             except: continue
-        if result is None: result = {"text": "Toutes les IA sont down", "self": {}, "sources": [], "model_used": "Aucun"}
+    if result is None: result = {"text": "Toutes les IA sont down", "self": {}, "sources": [], "model_used": "Aucun"}
     await save_conversation_to_rag(prompt, result["text"])
     return result
 
@@ -258,8 +266,7 @@ async def heartbeat():
         else:
             logger.warning(f"[HEARTBEAT] Patch REJETÉ: {anomaly['raison']}")
     if collection_logs: collection_logs.insert_one({"timestamp": datetime.utcnow(), "diagnostic": diagnostic})
-    if nb_approved > 0:
-        await send_telegram(f"Rapport 30min: {nb_approved} patch(s) appliqué(s). Etat: {diagnostic.get('etat')}")
+    if nb_approved > 0: await send_telegram(f"Rapport 30min: {nb_approved} patch(s) appliqué(s). Etat: {diagnostic.get('etat')}")
     logger.success("[HEARTBEAT] Terminé")
 
 def start_heartbeat():
@@ -267,14 +274,30 @@ def start_heartbeat():
     scheduler.start()
     logger.info("[HEARTBEAT] Scheduler lancé: toutes les 30 minutes")
 
-# ===== ROUTE TTS =====
+# ===== ROUTE TTS V3.6.1 - FIX MODELE =====
 router = APIRouter()
+
 @router.post("/tts")
 async def text_to_speech(req: Request):
     data = await req.json()
     text = data.get("text", "")
     if not GEMINI_KEYS: return {"error": "Aucune GEMINI_KEY"}
     client = genai.Client(api_key=GEMINI_KEYS[0])
-    response = client.models.generate_content(model="gemini-2.5-flash-tts-preview", contents=f"Voix masculine britannique: {text}", config=types.GenerateContentConfig(response_modalities=["AUDIO"], speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Puck")))))
-    audio_base64 = base64.b64encode(response.candidates[0].content.parts[0].inline_data.data).decode('utf-8')
-    return {"audio": audio_base64}
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-pro-preview-tts", # <-- FIX: Ancien modèle n'existe plus
+            contents=f"Dites ceci avec une voix masculine britannique calme: {text}",
+            config=types.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Kore") # Kore, Puck, Charon, Fenrir
+                    )
+                )
+            )
+        )
+        audio_base64 = base64.b64encode(response.candidates[0].content.parts[0].inline_data.data).decode('utf-8')
+        return {"audio": audio_base64}
+    except Exception as e:
+        logger.error(f"[TTS] Erreur: {e}")
+        return {"error": str(e)}
