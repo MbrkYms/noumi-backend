@@ -14,8 +14,8 @@ from telegram import Bot
 
 # ===== CONFIG =====
 MONGO_URI = os.getenv("MONGO_URI")
-MASTER_PASSWORD = "LUCIOLE"
-SESSIONS = {}
+MASTER_PASSWORD = "LUCIOLE" # MOT DE PASSE POUR MODE PERSONNEL
+SESSIONS = {} # N°2: Stocke les sessions Web {session_id: user_id}
 
 if MONGO_URI:
     client_mongo = MongoClient(MONGO_URI, maxPoolSize=10)
@@ -24,7 +24,7 @@ if MONGO_URI:
     collection_identity = db["identity"]
     collection_patches = db["patches"]
     collection_logs = db["logs"]
-    collection_auth = db["auth"]
+    collection_auth = db["auth"] # N°2: Stocke qui est authentifié
     logger.success("[MONGO] Connecté")
 else:
     client_mongo = db = collection_memory = collection_identity = collection_patches = collection_logs = collection_auth = None
@@ -32,7 +32,7 @@ else:
 
 scheduler = AsyncIOScheduler()
 # V3.7.4: OPTIM EMBEDDING -> BGE-SMALL
-embed_model = SentenceTransformer('BAAI/bge-small-en-v1.5') # Meilleur pour RAG que MiniLM
+embed_model = SentenceTransformer('BAAI/bge-small-en-v1.5')
 logger.success("[EMBEDDING] Modèle BGE-Small chargé")
 
 # ===== CLÉS =====
@@ -70,9 +70,9 @@ def _clean_json(text):
         except: pass
     return {"text": text, "self": {}}
 
-# ===== AUTH MULTI-USER =====
+# ===== AUTH MULTI-USER N°2 =====
 async def is_authenticated(user_id: str) -> bool:
-    if collection_auth is None: return user_id == "yamine"
+    if collection_auth is None: return user_id == "yamine" # Mode dev
     doc = collection_auth.find_one({"user_id": user_id})
     return doc.get("authenticated", False) if doc else False
 
@@ -87,32 +87,48 @@ async def send_telegram(message: str):
     if not telegram_bot or not TELEGRAM_CHAT_ID: return {"status": "error", "message": "Config manquante"}
     try:
         await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🔔 *STELLIA*\n\n{message}", parse_mode='Markdown')
+        logger.success(f"[TELEGRAM] Notif envoyée")
         return {"status": "success"}
     except Exception as e: return {"status": "error", "message": str(e)}
 
-async def deploy_railway(): await send_telegram("Lancement du déploiement sur Railway..."); return {"status": "success", "message": "Deploy lancé."}
+async def deploy_railway():
+    logger.warning(" Deploy Railway demandé")
+    await send_telegram("Lancement du déploiement sur Railway...")
+    return {"status": "success", "message": "Deploy lancé. Railway redémarre."}
+
 async def create_file(filename: str, content: str):
     with open(filename, "w", encoding="utf-8") as f: f.write(content)
-    await send_telegram(f"Fichier créé: `{filename}`"); return {"status": "success", "file": filename}
+    logger.success(f" Fichier créé: {filename}")
+    await send_telegram(f"Fichier créé: `{filename}`")
+    return {"status": "success", "file": filename}
+
 async def read_file(filename: str):
     try:
         with open(filename, "r", encoding="utf-8") as f: content = f.read()
         return {"status": "success", "content": content[:3000]}
     except Exception as e: return {"status": "error", "message": str(e)}
+
 async def run_command(command: str):
+    logger.warning(f" Commande exécutée: {command}")
     result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
-    if len(result.stdout + result.stderr) > 1000: await send_telegram(f"Commande exécutée. Résultat trop long, voir logs.")
+    output = result.stdout[:2000] + result.stderr[:2000]
+    if len(output) > 1000: await send_telegram(f"Commande exécutée. Résultat trop long, voir logs.")
     return {"status": "success", "stdout": result.stdout[:2000], "stderr": result.stderr[:2000]}
-async def get_status(): return {"ram": f"{psutil.virtual_memory().percent}%", "cpu": f"{psutil.cpu_percent()}%", "db": "OK" if collection_memory else "OFF"}
+
+async def get_status():
+    ram = psutil.virtual_memory().percent
+    cpu = psutil.cpu_percent()
+    db_status = "OK" if collection_memory else "OFF"
+    return {"ram": f"{ram}%", "cpu": f"{cpu}%", "db": db_status}
 
 TOOLS = {"deploy_railway": deploy_railway, "create_file": create_file, "read_file": read_file, "run_command": run_command, "send_telegram": send_telegram, "get_status": get_status}
 TOOL_DESCRIPTIONS = """Tu as accès à ces outils: 1. deploy_railway 2. create_file 3. read_file 4. run_command 5. send_telegram 6. get_status"""
 
-# ===== RAG MEMOIRE MULTI-USER BGE =====
+# ===== RAG MEMOIRE MULTI-USER V3.7.4 BGE =====
 async def save_conversation_to_rag(user_id: str, user_msg: str, ai_msg: str):
     if collection_memory is None: return
-    # V3.7.4: BGE demande un prefix "passage: "
     text = f"User: {user_msg}\nSTELLIA: {ai_msg}"
+    # BGE demande prefix "passage: "
     embedding = embed_model.encode("passage: " + text).tolist()
     collection_memory.insert_one({"user_id": user_id, "timestamp": datetime.utcnow(), "text": text, "embedding": embedding})
     if collection_memory.count_documents({"user_id": user_id}) > 1000:
@@ -121,7 +137,7 @@ async def save_conversation_to_rag(user_id: str, user_msg: str, ai_msg: str):
 
 async def search_memory(user_id: str, query: str, top_k=3) -> str:
     if collection_memory is None: return ""
-    # V3.7.4: BGE demande un prefix "query: "
+    # BGE demande prefix "query: "
     query_embedding = embed_model.encode("query: " + query)
     all_docs = list(collection_memory.find({"user_id": user_id, "embedding": {"$exists": True}}).sort("timestamp", -1).limit(200))
     if not all_docs: return ""
@@ -160,6 +176,7 @@ def save_patch_to_mongo(patch_data: dict, anomaly_score: dict):
 
 async def apply_patch(patch: dict):
     titre = patch.get("titre", "Sans titre"); code = patch.get("code", ""); fichier_cible = "ai_router.py"
+    logger.warning(f"[AUTO-PATCH] Application: {titre}")
     try:
         backup_file = f"{fichier_cible}.bak.{int(datetime.utcnow().timestamp())}"
         shutil.copy(fichier_cible, backup_file)
@@ -167,25 +184,23 @@ async def apply_patch(patch: dict):
         result = subprocess.run([sys.executable, "-m", "py_compile", fichier_cible], capture_output=True, text=True)
         if result.returncode!= 0: raise Exception(f"Erreur syntaxe: {result.stderr}")
         await send_telegram(f"Patch auto-appliqué: *{titre}*")
+        logger.success(f"[AUTO-PATCH] Succès.")
     except Exception as e:
         await send_telegram(f"Échec patch: *{titre}*. Restauration effectuée.")
+        logger.error(f"[AUTO-PATCH] ÉCHEC: {e}. Restauration...")
         shutil.copy(backup_file, fichier_cible)
 
 # ===== ROUTER IA V3.7.4 SMART =====
-def select_provider(prompt: str, enable_search: bool): # NOUVEAU ROUTER INTELLIGENT
+def select_provider(prompt: str, enable_search: bool):
     prompt_lower = prompt.lower()
     prompt_len = len(prompt)
-
     # Règle 1: Recherche Web = Gemini Obligatoire
     if enable_search: return [{"name": "Gemini", "key": GEMINI_KEYS[0] if GEMINI_KEYS else None}]
-
     # Règle 2: Programmation = DeepSeek
-    if any(k in prompt_lower for k in ["code", "python", "fonction", "bug", "erreur", "débug", "patch"]):
+    if any(k in prompt_lower for k in ["code", "python", "fonction", "bug", "erreur", "débug", "patch", "class", "def"]):
         return [p for p in PROVIDERS if p["name"] == "DeepSeek"] + [{"name": "Gemini", "key": GEMINI_KEYS[0] if GEMINI_KEYS else None}]
-
     # Règle 3: Prompt Long > 500 char = Gemini
     if prompt_len > 500: return [{"name": "Gemini", "key": GEMINI_KEYS[0] if GEMINI_KEYS else None}]
-
     # Règle 4: Prompt Court/Simple = Groq
     return [p for p in PROVIDERS if p["name"] == "Groq"] + [{"name": "Gemini", "key": GEMINI_KEYS[0] if GEMINI_KEYS else None}]
 
@@ -201,6 +216,7 @@ async def _call_gemini_with_key(api_key, key_index, prompt, enable_search=False)
     if result.get("tool") and result["tool"] in TOOLS:
         tool_result = await TOOLS[result["tool"]](**result["params"])
         result["text"] = f"{result['text']}\n\n[Résultat]: {tool_result}"
+        result["tool_result"] = tool_result
     result["model_used"] = f"Gemini-2.5-Flash [Clé {key_index}]"
     return result
 
@@ -234,6 +250,9 @@ async def handle_command(user_id: str, command: str):
     return None
 
 async def ask_ai(user_id: str, prompt, enable_search=False):
+    # FIX N°2: Check si prompt est None
+    if not prompt: return {"text": "Je n'ai rien reçu Monsieur.", "model_used": "Garde"}
+
     if not await is_authenticated(user_id) and not prompt.upper().startswith("LUCIOLE"):
         return {"text": "Bonjour. Pour accéder au mode personnel, veuillez taper: `LUCIOLE`", "model_used": "Garde", "sources": [], "auth_required": True}
     if prompt.startswith("/"):
@@ -241,10 +260,8 @@ async def ask_ai(user_id: str, prompt, enable_search=False):
         if cmd_result: return {"text": str(cmd_result.get("text", cmd_result)), "model_used": "Commande Directe", "sources": [], "auth": cmd_result.get("auth")}
     rag_context = await search_memory(user_id, prompt)
     final_prompt = f"CONTEXTE PASSÉ:\n{rag_context}\n\nQUESTION: {prompt}" if rag_context else prompt
-
     result = None
-    providers_to_try = select_provider(final_prompt, enable_search) # V3.7.4: Nouveau router
-
+    providers_to_try = select_provider(final_prompt, enable_search) # V3.7.4: Smart Router
     for p in providers_to_try:
         if not p.get("key"): continue
         try:
@@ -252,23 +269,28 @@ async def ask_ai(user_id: str, prompt, enable_search=False):
             else: result = await _call_rest(p, final_prompt)
             break
         except Exception as e: logger.warning(f"[ROUTER] {p['name']} failed: {e}"); continue
-
     if result is None: result = {"text": "Toutes les IA sont down", "self": {}, "sources": [], "model_used": "Aucun"}
     await save_conversation_to_rag(user_id, prompt, result["text"])
     return result
 
-# ===== TELEGRAM POLLING =====
+# ===== TELEGRAM POLLING BIDIRECTIONNEL AVEC AUTH + FIX =====
 async def telegram_polling():
     if not telegram_bot: return
-    await send_telegram("STELLIA V3.7.4 en ligne. BGE + Smart Router actifs.\nTapez `LUCIOLE` pour vous connecter.\n" + COMMAND_LIST)
     offset = None
+    await send_telegram("STELLIA V3.7.5 en ligne. Bug fix appliqué.\nTapez `LUCIOLE` pour vous connecter.\n" + COMMAND_LIST)
     while True:
         try:
             updates = await telegram_bot.get_updates(offset=offset, timeout=10)
             for update in updates:
                 if update.message and str(update.message.chat_id) == TELEGRAM_CHAT_ID:
-                    user_text = update.message.text
+                    user_text = update.message.text # FIX N°1: Peut être None
+                    if not user_text: # Ignore les photos/stickers/vocaux
+                        logger.warning("[TELEGRAM] Message sans texte reçu. Ignoré.")
+                        offset = update.update_id + 1
+                        continue
+
                     user_id = f"telegram_{update.message.chat_id}"
+                    logger.info(f"[TELEGRAM IN] {user_text}")
                     ai_response = await ask_ai(user_id, user_text)
                     await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"*{ai_response['text']}*\n\n`Modèle: {ai_response['model_used']}`", parse_mode='Markdown')
                     offset = update.update_id + 1
@@ -276,9 +298,16 @@ async def telegram_polling():
         await asyncio.sleep(1)
 
 # ===== HEARTBEAT =====
-async def generate_diagnostic() -> dict: return await _call_gemini_with_key(GEMINI_KEYS[0], 1, "Fais un diagnostic. Réponds en JSON: {\"etat\": \"OK\", \"optimisations\": [\"Cache LRU\"]}")
+async def generate_diagnostic() -> dict:
+    if not GEMINI_KEYS: return {"etat": "ERREUR", "optimisations": []}
+    prompt = """Tu es STELLIA. Fais un diagnostic. Propose 2 optimisations concrètes en code python. Réponds en JSON: {"etat": "OK", "optimisations": ["Ajouter un cache LRU"]}"""
+    return await _call_gemini_with_key(GEMINI_KEYS[0], 1, prompt)
+
 async def generate_patches(diagnostic: dict) -> list:
-    result = await _call_gemini_with_key(GEMINI_KEYS[0], 1, f"Basé sur: {diagnostic}. Propose 2 patchs. Format JSON: {{\"patches\": [{{...}}]}}")
+    if not GEMINI_KEYS: return []
+    points = ", ".join(diagnostic.get("optimisations", []))
+    prompt = f"""Basé sur: {points}. Propose 2 patchs de code python pour STELLIA. Format JSON: {{"patches": [{{"titre": "...", "description": "...", "code": "def ma_fonction(): pass"}}]}}"""
+    result = await _call_gemini_with_key(GEMINI_KEYS[0], 1, prompt)
     return result.get("patches", [])
 
 async def heartbeat():
@@ -289,17 +318,23 @@ async def heartbeat():
     for patch in patches:
         anomaly = await detect_anomaly(patch["code"])
         save_patch_to_mongo(patch, anomaly)
-        if anomaly["score"] >= 8: await apply_patch(patch); nb_approved += 1; await asyncio.sleep(5)
+        if anomaly["score"] >= 8:
+            logger.success(f"[HEARTBEAT] Patch APPROUVÉ: {patch['titre']}")
+            await apply_patch(patch)
+            nb_approved += 1
+            await asyncio.sleep(5)
+        else: logger.warning(f"[HEARTBEAT] Patch REJETÉ: {anomaly['raison']}")
     if collection_logs: collection_logs.insert_one({"timestamp": datetime.utcnow(), "diagnostic": diagnostic})
     if nb_approved > 0: await send_telegram(f"Rapport 30min: {nb_approved} patch(s) appliqué(s). Etat: {diagnostic.get('etat')}")
+    logger.success("[HEARTBEAT] Terminé")
 
 def start_heartbeat():
     scheduler.add_job(heartbeat, 'interval', minutes=30)
     scheduler.start()
     asyncio.create_task(telegram_polling())
-    logger.info("[HEARTBEAT] Scheduler lancé")
+    logger.info("[HEARTBEAT] Scheduler lancé: toutes les 30 minutes + Polling Telegram actif")
 
-# ===== ROUTES API =====
+# ===== ROUTES API V3.7.5 =====
 router = APIRouter()
 
 @router.post("/auth")
@@ -310,6 +345,7 @@ async def web_auth(req: Request):
     user_id = f"web_{session_id}"
     if await authenticate_user(user_id, password):
         SESSIONS[session_id] = user_id
+        logger.success(f"[AUTH WEB] Session créée: {session_id}")
         return {"status": "success", "session_id": session_id, "message": "Authentifié"}
     return {"status": "error", "message": "Mot de passe incorrect"}
 
@@ -319,7 +355,7 @@ async def text_to_speech(req: Request):
     text = data.get("text", "")
     session_id = data.get("session_id")
     user_id = SESSIONS.get(session_id, "guest")
-    if not await is_authenticated(user_id): return {"error": "Auth requise."}
+    if not await is_authenticated(user_id): return {"error": "Auth requise. Connectez-vous avec LUCIOLE d'abord."}
     if not GEMINI_KEYS: return {"error": "Aucune GEMINI_KEY"}
     client = genai.Client(api_key=GEMINI_KEYS[0])
     try:
@@ -330,4 +366,6 @@ async def text_to_speech(req: Request):
         )
         audio_base64 = base64.b64encode(response.candidates[0].content.parts[0].inline_data.data).decode('utf-8')
         return {"audio": audio_base64}
-    except Exception as e: return {"error": str(e)}
+    except Exception as e:
+        logger.error(f"[TTS] Erreur: {e}")
+        return {"error": str(e)}
