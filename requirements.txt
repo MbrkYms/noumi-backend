@@ -10,3 +10,5 @@ pymongo>=4.6
 loguru>=0.7
 tenacity>=9.0
 apscheduler>=3.11.0
+sentence-transformers>=3.0.0
+numpy>=1.26.0
