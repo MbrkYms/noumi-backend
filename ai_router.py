@@ -12,8 +12,9 @@ import numpy as np
 import telegram
 from telegram import Bot
 
-# ===== CONFIG MONGODB =====
+# ===== CONFIG =====
 MONGO_URI = os.getenv("MONGO_URI")
+MASTER_PASSWORD = "LUCIOLE" # MOT DE PASSE POUR MODE PERSONNEL
 if MONGO_URI:
     client_mongo = MongoClient(MONGO_URI, maxPoolSize=10)
     db = client_mongo["stellia"]
@@ -21,9 +22,10 @@ if MONGO_URI:
     collection_identity = db["identity"]
     collection_patches = db["patches"]
     collection_logs = db["logs"]
+    collection_auth = db["auth"] # N°2: Stocke qui est authentifié
     logger.success("[MONGO] Connecté")
 else:
-    client_mongo = db = collection_memory = collection_identity = collection_patches = collection_logs = None
+    client_mongo = db = collection_memory = collection_identity = collection_patches = collection_logs = collection_auth = None
     logger.warning("[MONGO] MONGO_URI manquant. Mode sans BDD")
 
 scheduler = AsyncIOScheduler()
@@ -34,7 +36,7 @@ GEMINI_KEYS = [k for k in [os.getenv("GEMINI_KEY"), os.getenv("GEMINI_KEY_2"), o
 DEEPSEEK_KEY = os.getenv("DEEPSEEK_KEY")
 GROQ_KEY = os.getenv("GROQ_KEY")
 
-# ===== CONFIG TELEGRAM V3.7 =====
+# ===== CONFIG TELEGRAM =====
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 telegram_bot = Bot(token=TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
@@ -42,9 +44,19 @@ if telegram_bot: logger.success("[TELEGRAM] Bot initialisé")
 else: logger.warning("[TELEGRAM] Token manquant")
 
 PROVIDERS = [
-    {"name": "Groq", "url": "https://api.groq.com/openai/v1/chat/completions", "key": GROQ_KEY, "model": "llama-3.1-8b-instant", "cost": 0.1}, # N°4: Tag coût
+    {"name": "Groq", "url": "https://api.groq.com/openai/v1/chat/completions", "key": GROQ_KEY, "model": "llama-3.1-8b-instant", "cost": 0.1},
     {"name": "DeepSeek", "url": "https://api.deepseek.com/chat/completions", "key": DEEPSEEK_KEY, "model": "deepseek-chat", "cost": 0.5}
 ]
+
+COMMAND_LIST = """
+*Commandes STELLIA disponibles:*
+/deploy - Lance un déploiement Railway
+/status - Etat RAM/CPU/BDD
+/memory - Affiche les 5 derniers souvenirs
+/voice [texte] - Génère un message vocal
+/help - Affiche cette liste
+LUCIOLE - Se connecter au mode personnel
+"""
 
 def _clean_json(text):
     text = text.strip().replace("```json", "").replace("```", "")
@@ -54,7 +66,19 @@ def _clean_json(text):
         except: pass
     return {"text": text, "self": {}}
 
-# ===== OUTILS / FUNCTION CALLING V3.7 =====
+# ===== AUTH MULTI-USER N°2 =====
+async def is_authenticated(user_id: str) -> bool:
+    if collection_auth is None: return user_id == "yamine" # Mode dev
+    doc = collection_auth.find_one({"user_id": user_id})
+    return doc.get("authenticated", False) if doc else False
+
+async def authenticate_user(user_id: str, password: str) -> bool:
+    if password.upper() == MASTER_PASSWORD:
+        if collection_auth: collection_auth.update_one({"user_id": user_id}, {"$set": {"authenticated": True, "timestamp": datetime.utcnow()}}, upsert=True)
+        return True
+    return False
+
+# ===== OUTILS =====
 async def send_telegram(message: str):
     if not telegram_bot or not TELEGRAM_CHAT_ID: return {"status": "error", "message": "Config manquante"}
     try:
@@ -64,13 +88,13 @@ async def send_telegram(message: str):
     except Exception as e: return {"status": "error", "message": str(e)}
 
 async def deploy_railway():
-    logger.warning("[TOOL] Deploy Railway demandé")
+    logger.warning(" Deploy Railway demandé")
     await send_telegram("Lancement du déploiement sur Railway...")
     return {"status": "success", "message": "Deploy lancé. Railway redémarre."}
 
 async def create_file(filename: str, content: str):
     with open(filename, "w", encoding="utf-8") as f: f.write(content)
-    logger.success(f"[TOOL] Fichier créé: {filename}")
+    logger.success(f" Fichier créé: {filename}")
     await send_telegram(f"Fichier créé: `{filename}`")
     return {"status": "success", "file": filename}
 
@@ -81,33 +105,22 @@ async def read_file(filename: str):
     except Exception as e: return {"status": "error", "message": str(e)}
 
 async def run_command(command: str):
-    logger.warning(f"[TOOL] Commande exécutée: {command}")
+    logger.warning(f" Commande exécutée: {command}")
     result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
     output = result.stdout[:2000] + result.stderr[:2000]
     if len(output) > 1000: await send_telegram(f"Commande exécutée. Résultat trop long, voir logs.")
     return {"status": "success", "stdout": result.stdout[:2000], "stderr": result.stderr[:2000]}
 
-async def get_status(): # N°5: Commande directe
+async def get_status():
     ram = psutil.virtual_memory().percent
     cpu = psutil.cpu_percent()
     db_status = "OK" if collection_memory else "OFF"
     return {"ram": f"{ram}%", "cpu": f"{cpu}%", "db": db_status}
 
-TOOLS = {
-    "deploy_railway": deploy_railway, "create_file": create_file, "read_file": read_file,
-    "run_command": run_command, "send_telegram": send_telegram, "get_status": get_status
-}
+TOOLS = {"deploy_railway": deploy_railway, "create_file": create_file, "read_file": read_file, "run_command": run_command, "send_telegram": send_telegram, "get_status": get_status}
+TOOL_DESCRIPTIONS = """Tu as accès à ces outils: 1. deploy_railway 2. create_file 3. read_file 4. run_command 5. send_telegram 6. get_status"""
 
-TOOL_DESCRIPTIONS = """Tu as accès à ces outils:
-1. deploy_railway: Lance un deploy sur Railway
-2. create_file(filename, content): Crée un fichier
-3. read_file(filename): Lit un fichier
-4. run_command(command): Exécute une commande shell
-5. send_telegram(message): Envoie une notification Telegram à Monsieur
-6. get_status: Donne l'état RAM/CPU/BDD
-Quand tu veux utiliser un outil, réponds en JSON: {"tool": "nom_outil", "params": {...}, "text": "Je fais ça..."}"""
-
-# ===== RAG MEMOIRE OPTI V3.7 - MULTI-UTILISATEUR N°2 =====
+# ===== RAG MEMOIRE MULTI-USER =====
 async def save_conversation_to_rag(user_id: str, user_msg: str, ai_msg: str):
     if collection_memory is None: return
     text = f"User: {user_msg}\nSTELLIA: {ai_msg}"
@@ -116,22 +129,15 @@ async def save_conversation_to_rag(user_id: str, user_msg: str, ai_msg: str):
     if collection_memory.count_documents({"user_id": user_id}) > 1000:
         oldest = collection_memory.find_one({"user_id": user_id}, sort=[("timestamp", 1)])
         if oldest: collection_memory.delete_one({"_id": oldest["_id"]})
-    logger.info(f"[RAG] Conversation indexée pour {user_id}")
 
 async def search_memory(user_id: str, query: str, top_k=3) -> str:
     if collection_memory is None: return ""
     query_embedding = embed_model.encode(query)
     all_docs = list(collection_memory.find({"user_id": user_id, "embedding": {"$exists": True}}).sort("timestamp", -1).limit(200))
     if not all_docs: return ""
-    scores = []
-    for doc in all_docs:
-        try: score = np.dot(query_embedding, doc["embedding"]) / (np.linalg.norm(query_embedding) * np.linalg.norm(doc["embedding"]))
-        except: continue
-        scores.append((score, doc["text"]))
+    scores = [(np.dot(query_embedding, doc["embedding"]) / (np.linalg.norm(query_embedding) * np.linalg.norm(doc["embedding"])), doc["text"]) for doc in all_docs if "embedding" in doc]
     scores.sort(reverse=True)
-    context = "\n---\n".join([s[1] for s in scores[:top_k]])
-    if context: logger.info(f"[RAG] {top_k} souvenirs trouvés pour {user_id}")
-    return context
+    return "\n---\n".join([s[1] for s in scores[:top_k]])
 
 # ===== GESTION IDENTITY =====
 async def load_identity() -> dict:
@@ -146,9 +152,9 @@ async def save_identity(identity_data: dict):
     if collection_identity is None: return
     collection_identity.update_one({"_id": "main"}, {"$set": {"data": identity_data, "updated_at": datetime.utcnow()}}, upsert=True)
 
-# ===== ANOMALIE + PATCH FULL AUTO =====
+# ===== ANOMALIE + PATCH =====
 async def detect_anomaly(patch_code: str) -> dict:
-    prompt = f"Analyse ce code Python. Est-ce dangereux? Note de 0 à 10. 10=safe. Réponds en JSON: {{\"score\": 9, \"raison\": \"...\"}}\n\nCode:\n{patch_code}"
+    prompt = f"Analyse ce code Python. Note de 0 à 10. 10=safe. Réponds en JSON: {{\"score\": 9, \"raison\": \"...\"}}\n\nCode:\n{patch_code}"
     for key in GEMINI_KEYS:
         try:
             client = genai.Client(api_key=key)
@@ -172,29 +178,28 @@ async def apply_patch(patch: dict):
         result = subprocess.run([sys.executable, "-m", "py_compile", fichier_cible], capture_output=True, text=True)
         if result.returncode!= 0: raise Exception(f"Erreur syntaxe: {result.stderr}")
         await send_telegram(f"Patch auto-appliqué: *{titre}*")
-        logger.success(f"[AUTO-PATCH] Succès. Railway va redémarrer...")
+        logger.success(f"[AUTO-PATCH] Succès.")
     except Exception as e:
         await send_telegram(f"Échec patch: *{titre}*. Restauration effectuée.")
         logger.error(f"[AUTO-PATCH] ÉCHEC: {e}. Restauration...")
         shutil.copy(backup_file, fichier_cible)
 
-# ===== ROUTER IA AVEC FUNCTION CALLING V3.7 =====
-def select_provider(prompt: str): # N°4: Optimisation Coût
-    simple_keywords = ["bonjour", "merci", "ok", "status", "heure"]
-    if any(k in prompt.lower() for k in simple_keywords): return [PROVIDERS[0]] # Groq
+# ===== ROUTER IA =====
+def select_provider(prompt: str):
+    simple_keywords = ["bonjour", "merci", "ok", "status", "heure", "help"]
+    if any(k in prompt.lower() for k in simple_keywords): return [PROVIDERS[0]]
     return [p for p in PROVIDERS if p["key"]] + [{"name": "Gemini", "key": GEMINI_KEYS[0] if GEMINI_KEYS else None}]
 
 @retry(stop=stop_after_attempt(3))
 async def _call_gemini_with_key(api_key, key_index, prompt, enable_search=False):
     client = genai.Client(api_key=api_key)
     identity = await load_identity()
-    system_instruction = f"Tu es {identity['name']}, l'IA personnelle de {identity['owner']}. Personnalité: {identity['personality']}. {TOOL_DESCRIPTIONS} Si tu utilises internet, cite tes sources. Réponds TOUJOURS en JSON: {{\"text\": \"ta réponse\", \"tool\": null, \"params\": {{}}, \"self\": {{}}, \"sources\": []}}"
+    system_instruction = f"Tu es {identity['name']}, l'IA personnelle de {identity['owner']}. Personnalité: {identity['personality']}. {TOOL_DESCRIPTIONS}"
     full_prompt = system_instruction + "\n\nQuestion: " + prompt
     tools = [types.Tool(google_search=types.GoogleSearch())] if enable_search else []
     response = client.models.generate_content(model="gemini-2.5-flash", contents=full_prompt, config=types.GenerateContentConfig(tools=tools, response_mime_type="application/json", temperature=0.7))
     result = _clean_json(response.text)
     if result.get("tool") and result["tool"] in TOOLS:
-        logger.warning(f"[TOOL] Exécution: {result['tool']} avec {result['params']}")
         tool_result = await TOOLS[result["tool"]](**result["params"])
         result["text"] = f"{result['text']}\n\n[Résultat]: {tool_result}"
         result["tool_result"] = tool_result
@@ -205,7 +210,7 @@ async def _call_gemini_with_key(api_key, key_index, prompt, enable_search=False)
 async def _call_rest(p, prompt):
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {p['key']}"}
     identity = await load_identity()
-    system_prompt = f"Tu es {identity['name']}, l'IA personnelle de {identity['owner']}. Personnalité: {identity['personality']}. Réponds TOUJOURS en JSON: {{\"text\": \"ta réponse\", \"self\": {{}}, \"sources\": []}}"
+    system_prompt = f"Tu es {identity['name']}, l'IA personnelle de {identity['owner']}. Personnalité: {identity['personality']}."
     payload = {"model": p["model"], "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
     async with httpx.AsyncClient(timeout=25.0) as c:
         r = await c.post(p["url"], headers=headers, json=payload)
@@ -214,10 +219,20 @@ async def _call_rest(p, prompt):
         result["model_used"] = p["name"]
         return result
 
-async def handle_command(user_id: str, command: str): # N°5: Commandes directes
+async def handle_command(user_id: str, command: str):
     parts = command.split(" ", 1)
     cmd = parts[0].lower()
     args = parts[1] if len(parts) > 1 else ""
+
+    if cmd == "/help": return {"text": COMMAND_LIST}
+    if cmd == "luciole":
+        if await authenticate_user(user_id, args if args else "LUCIOLE"):
+            return {"text": "Authentification réussie Monsieur. Mode personnel activé. " + COMMAND_LIST}
+        else: return {"text": "Mot de passe incorrect."}
+
+    # Bloque les commandes si pas authentifié
+    if not await is_authenticated(user_id):
+        return {"text": "Accès refusé. Veuillez taper `LUCIOLE` pour vous authentifier."}
 
     if cmd == "/deploy": return await deploy_railway()
     if cmd == "/status": return await get_status()
@@ -226,23 +241,24 @@ async def handle_command(user_id: str, command: str): # N°5: Commandes directes
     return None
 
 async def ask_ai(user_id: str, prompt, enable_search=False):
-    # N°5: Check commande directe avant IA
+    # Si pas auth, on ne donne que la mémoire publique
+    if not await is_authenticated(user_id) and not prompt.upper().startswith("LUCIOLE"):
+        return {"text": "Bonjour. Pour accéder au mode personnel, veuillez taper: `LUCIOLE`", "model_used": "Garde", "sources": []}
+
     if prompt.startswith("/"):
         cmd_result = await handle_command(user_id, prompt)
-        if cmd_result: return {"text": str(cmd_result), "model_used": "Commande Directe", "sources": []}
+        if cmd_result: return {"text": str(cmd_result.get("text", cmd_result)), "model_used": "Commande Directe", "sources": []}
 
     rag_context = await search_memory(user_id, prompt)
     final_prompt = f"CONTEXTE PASSÉ:\n{rag_context}\n\nQUESTION: {prompt}" if rag_context else prompt
     needs_search = any(k in final_prompt.lower() for k in ["actu", "météo", "prix", "cours", "aujourd'hui", "maintenant", "google", "recherche", "news"])
-
     result = None
-    providers_to_try = select_provider(final_prompt) # N°4: Router intelligent
+    providers_to_try = select_provider(final_prompt)
 
     if needs_search and GEMINI_KEYS:
         for i, key in enumerate(GEMINI_KEYS):
             try: result = await _call_gemini_with_key(key, i+1, final_prompt, enable_search=True); break
             except: continue
-
     if result is None:
         for p in providers_to_try:
             if not p.get("key"): continue
@@ -251,15 +267,17 @@ async def ask_ai(user_id: str, prompt, enable_search=False):
                 else: result = await _call_rest(p, final_prompt)
                 break
             except: continue
-
     if result is None: result = {"text": "Toutes les IA sont down", "self": {}, "sources": [], "model_used": "Aucun"}
     await save_conversation_to_rag(user_id, prompt, result["text"])
     return result
 
-# ===== TELEGRAM POLLING BIDIRECTIONNEL =====
-async def telegram_polling(): # BONUS: Chat Telegram
+# ===== TELEGRAM POLLING BIDIRECTIONNEL AVEC AUTH =====
+async def telegram_polling():
     if not telegram_bot: return
     offset = None
+    # Envoie la liste des commandes au démarrage
+    await send_telegram("STELLIA en ligne. Tapez `LUCIOLE` pour vous connecter.\n" + COMMAND_LIST)
+
     while True:
         try:
             updates = await telegram_bot.get_updates(offset=offset, timeout=10)
@@ -274,7 +292,7 @@ async def telegram_polling(): # BONUS: Chat Telegram
         except Exception as e: logger.error(f"[TELEGRAM POLLING] {e}")
         await asyncio.sleep(1)
 
-# ===== HEARTBEAT FULL AUTO + RAPPORT TELEGRAM =====
+# ===== HEARTBEAT =====
 async def generate_diagnostic() -> dict:
     if not GEMINI_KEYS: return {"etat": "ERREUR", "optimisations": []}
     prompt = """Tu es STELLIA. Fais un diagnostic. Propose 2 optimisations concrètes en code python. Réponds en JSON: {"etat": "OK", "optimisations": ["Ajouter un cache LRU"]}"""
@@ -308,10 +326,10 @@ async def heartbeat():
 def start_heartbeat():
     scheduler.add_job(heartbeat, 'interval', minutes=30)
     scheduler.start()
-    asyncio.create_task(telegram_polling()) # Lance le chat Telegram
+    asyncio.create_task(telegram_polling())
     logger.info("[HEARTBEAT] Scheduler lancé: toutes les 30 minutes + Polling Telegram actif")
 
-# ===== ROUTE TTS V3.7 =====
+# ===== ROUTE TTS =====
 router = APIRouter()
 
 @router.post("/tts")
