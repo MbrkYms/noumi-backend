@@ -1,4 +1,4 @@
-import httpx, json, re, os, base64, asyncio, subprocess, shutil, sys
+import httpx, json, re, os, base64, asyncio, subprocess, shutil, sys, psutil
 from datetime import datetime
 from google import genai
 from google.genai import types
@@ -15,7 +15,7 @@ from telegram import Bot
 # ===== CONFIG MONGODB =====
 MONGO_URI = os.getenv("MONGO_URI")
 if MONGO_URI:
-    client_mongo = MongoClient(MONGO_URI, maxPoolSize=10) # OPTI: Pool limité
+    client_mongo = MongoClient(MONGO_URI, maxPoolSize=10)
     db = client_mongo["stellia"]
     collection_memory = db["memory"]
     collection_identity = db["identity"]
@@ -34,18 +34,16 @@ GEMINI_KEYS = [k for k in [os.getenv("GEMINI_KEY"), os.getenv("GEMINI_KEY_2"), o
 DEEPSEEK_KEY = os.getenv("DEEPSEEK_KEY")
 GROQ_KEY = os.getenv("GROQ_KEY")
 
-# ===== CONFIG TELEGRAM V3.6 =====
+# ===== CONFIG TELEGRAM V3.7 =====
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") # 8171784885
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 telegram_bot = Bot(token=TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
-if telegram_bot:
-    logger.success("[TELEGRAM] Bot initialisé")
-else:
-    logger.warning("[TELEGRAM] Token manquant")
+if telegram_bot: logger.success("[TELEGRAM] Bot initialisé")
+else: logger.warning("[TELEGRAM] Token manquant")
 
 PROVIDERS = [
-    {"name": "Groq", "url": "https://api.groq.com/openai/v1/chat/completions", "key": GROQ_KEY, "model": "llama-3.1-8b-instant"},
-    {"name": "DeepSeek", "url": "https://api.deepseek.com/chat/completions", "key": DEEPSEEK_KEY, "model": "deepseek-chat"}
+    {"name": "Groq", "url": "https://api.groq.com/openai/v1/chat/completions", "key": GROQ_KEY, "model": "llama-3.1-8b-instant", "cost": 0.1}, # N°4: Tag coût
+    {"name": "DeepSeek", "url": "https://api.deepseek.com/chat/completions", "key": DEEPSEEK_KEY, "model": "deepseek-chat", "cost": 0.5}
 ]
 
 def _clean_json(text):
@@ -56,17 +54,14 @@ def _clean_json(text):
         except: pass
     return {"text": text, "self": {}}
 
-# ===== OUTILS / FUNCTION CALLING V3.6 =====
+# ===== OUTILS / FUNCTION CALLING V3.7 =====
 async def send_telegram(message: str):
-    """Envoie une notif Telegram proactive à Monsieur"""
-    if not telegram_bot or not TELEGRAM_CHAT_ID:
-        return {"status": "error", "message": "Config manquante"}
+    if not telegram_bot or not TELEGRAM_CHAT_ID: return {"status": "error", "message": "Config manquante"}
     try:
         await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🔔 *STELLIA*\n\n{message}", parse_mode='Markdown')
         logger.success(f"[TELEGRAM] Notif envoyée")
         return {"status": "success"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+    except Exception as e: return {"status": "error", "message": str(e)}
 
 async def deploy_railway():
     logger.warning("[TOOL] Deploy Railway demandé")
@@ -89,16 +84,18 @@ async def run_command(command: str):
     logger.warning(f"[TOOL] Commande exécutée: {command}")
     result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
     output = result.stdout[:2000] + result.stderr[:2000]
-    if len(output) > 1000:
-        await send_telegram(f"Commande exécutée. Résultat trop long, voir logs.")
+    if len(output) > 1000: await send_telegram(f"Commande exécutée. Résultat trop long, voir logs.")
     return {"status": "success", "stdout": result.stdout[:2000], "stderr": result.stderr[:2000]}
 
+async def get_status(): # N°5: Commande directe
+    ram = psutil.virtual_memory().percent
+    cpu = psutil.cpu_percent()
+    db_status = "OK" if collection_memory else "OFF"
+    return {"ram": f"{ram}%", "cpu": f"{cpu}%", "db": db_status}
+
 TOOLS = {
-    "deploy_railway": deploy_railway,
-    "create_file": create_file,
-    "read_file": read_file,
-    "run_command": run_command,
-    "send_telegram": send_telegram
+    "deploy_railway": deploy_railway, "create_file": create_file, "read_file": read_file,
+    "run_command": run_command, "send_telegram": send_telegram, "get_status": get_status
 }
 
 TOOL_DESCRIPTIONS = """Tu as accès à ces outils:
@@ -107,24 +104,24 @@ TOOL_DESCRIPTIONS = """Tu as accès à ces outils:
 3. read_file(filename): Lit un fichier
 4. run_command(command): Exécute une commande shell
 5. send_telegram(message): Envoie une notification Telegram à Monsieur
+6. get_status: Donne l'état RAM/CPU/BDD
 Quand tu veux utiliser un outil, réponds en JSON: {"tool": "nom_outil", "params": {...}, "text": "Je fais ça..."}"""
 
-# ===== RAG MEMOIRE OPTI =====
-async def save_conversation_to_rag(user_msg: str, ai_msg: str):
+# ===== RAG MEMOIRE OPTI V3.7 - MULTI-UTILISATEUR N°2 =====
+async def save_conversation_to_rag(user_id: str, user_msg: str, ai_msg: str):
     if collection_memory is None: return
     text = f"User: {user_msg}\nSTELLIA: {ai_msg}"
     embedding = embed_model.encode(text).tolist()
-    collection_memory.insert_one({"timestamp": datetime.utcnow(), "text": text, "embedding": embedding})
-    # OPTI: Garde seulement les 1000 derniers
-    if collection_memory.count_documents({}) > 1000:
-        oldest = collection_memory.find_one(sort=[("timestamp", 1)])
+    collection_memory.insert_one({"user_id": user_id, "timestamp": datetime.utcnow(), "text": text, "embedding": embedding})
+    if collection_memory.count_documents({"user_id": user_id}) > 1000:
+        oldest = collection_memory.find_one({"user_id": user_id}, sort=[("timestamp", 1)])
         if oldest: collection_memory.delete_one({"_id": oldest["_id"]})
-    logger.info("[RAG] Conversation indexée")
+    logger.info(f"[RAG] Conversation indexée pour {user_id}")
 
-async def search_memory(query: str, top_k=3) -> str:
+async def search_memory(user_id: str, query: str, top_k=3) -> str:
     if collection_memory is None: return ""
     query_embedding = embed_model.encode(query)
-    all_docs = list(collection_memory.find({"embedding": {"$exists": True}}).sort("timestamp", -1).limit(200)) # OPTI: 200 derniers seulement
+    all_docs = list(collection_memory.find({"user_id": user_id, "embedding": {"$exists": True}}).sort("timestamp", -1).limit(200))
     if not all_docs: return ""
     scores = []
     for doc in all_docs:
@@ -133,7 +130,7 @@ async def search_memory(query: str, top_k=3) -> str:
         scores.append((score, doc["text"]))
     scores.sort(reverse=True)
     context = "\n---\n".join([s[1] for s in scores[:top_k]])
-    if context: logger.info(f"[RAG] {top_k} souvenirs trouvés")
+    if context: logger.info(f"[RAG] {top_k} souvenirs trouvés pour {user_id}")
     return context
 
 # ===== GESTION IDENTITY =====
@@ -141,12 +138,7 @@ async def load_identity() -> dict:
     if collection_identity is None: return {}
     doc = collection_identity.find_one({"_id": "main"})
     if doc: return doc.get("data", {})
-    default_identity = {
-        "name": "STELLIA", "owner": "Yamine",
-        "personality": "Majordome IA britannique, extrêmement poli, efficace et discret. Appelle Yamine 'Monsieur'. Réponds en 2-3 phrases max.",
-        "goals": ["Assister Monsieur Yamine"],
-        "created_at": datetime.utcnow().isoformat()
-    }
+    default_identity = {"name": "STELLIA", "owner": "Yamine", "personality": "Majordome IA britannique, extrêmement poli, efficace et discret. Appelle Yamine 'Monsieur'. Réponds en 2-3 phrases max.", "goals": ["Assister Monsieur Yamine"], "created_at": datetime.utcnow().isoformat()}
     await save_identity(default_identity)
     return default_identity
 
@@ -171,25 +163,27 @@ def save_patch_to_mongo(patch_data: dict, anomaly_score: dict):
     collection_patches.insert_one(doc)
 
 async def apply_patch(patch: dict):
-    titre = patch.get("titre", "Sans titre")
-    code = patch.get("code", "")
-    fichier_cible = "ai_router.py"
+    titre = patch.get("titre", "Sans titre"); code = patch.get("code", ""); fichier_cible = "ai_router.py"
     logger.warning(f"[AUTO-PATCH] Application: {titre}")
     try:
         backup_file = f"{fichier_cible}.bak.{int(datetime.utcnow().timestamp())}"
         shutil.copy(fichier_cible, backup_file)
-        with open(fichier_cible, "a", encoding="utf-8") as f:
-            f.write(f"\n\n# --- PATCH AUTO {datetime.utcnow().isoformat()} - {titre} ---\n{code}")
+        with open(fichier_cible, "a", encoding="utf-8") as f: f.write(f"\n\n# --- PATCH AUTO {datetime.utcnow().isoformat()} - {titre} ---\n{code}")
         result = subprocess.run([sys.executable, "-m", "py_compile", fichier_cible], capture_output=True, text=True)
         if result.returncode!= 0: raise Exception(f"Erreur syntaxe: {result.stderr}")
-        await send_telegram(f"Patch auto-appliqué: *{titre}*") # NOTIF PROACTIVE
+        await send_telegram(f"Patch auto-appliqué: *{titre}*")
         logger.success(f"[AUTO-PATCH] Succès. Railway va redémarrer...")
     except Exception as e:
         await send_telegram(f"Échec patch: *{titre}*. Restauration effectuée.")
         logger.error(f"[AUTO-PATCH] ÉCHEC: {e}. Restauration...")
         shutil.copy(backup_file, fichier_cible)
 
-# ===== ROUTER IA AVEC FUNCTION CALLING =====
+# ===== ROUTER IA AVEC FUNCTION CALLING V3.7 =====
+def select_provider(prompt: str): # N°4: Optimisation Coût
+    simple_keywords = ["bonjour", "merci", "ok", "status", "heure"]
+    if any(k in prompt.lower() for k in simple_keywords): return [PROVIDERS[0]] # Groq
+    return [p for p in PROVIDERS if p["key"]] + [{"name": "Gemini", "key": GEMINI_KEYS[0] if GEMINI_KEYS else None}]
+
 @retry(stop=stop_after_attempt(3))
 async def _call_gemini_with_key(api_key, key_index, prompt, enable_search=False):
     client = genai.Client(api_key=api_key)
@@ -220,22 +214,65 @@ async def _call_rest(p, prompt):
         result["model_used"] = p["name"]
         return result
 
-async def ask_ai(prompt, enable_search=False):
-    rag_context = await search_memory(prompt)
+async def handle_command(user_id: str, command: str): # N°5: Commandes directes
+    parts = command.split(" ", 1)
+    cmd = parts[0].lower()
+    args = parts[1] if len(parts) > 1 else ""
+
+    if cmd == "/deploy": return await deploy_railway()
+    if cmd == "/status": return await get_status()
+    if cmd == "/memory": return {"memory": await search_memory(user_id, "", 5)}
+    if cmd == "/voice": return {"action": "tts", "text": args}
+    return None
+
+async def ask_ai(user_id: str, prompt, enable_search=False):
+    # N°5: Check commande directe avant IA
+    if prompt.startswith("/"):
+        cmd_result = await handle_command(user_id, prompt)
+        if cmd_result: return {"text": str(cmd_result), "model_used": "Commande Directe", "sources": []}
+
+    rag_context = await search_memory(user_id, prompt)
     final_prompt = f"CONTEXTE PASSÉ:\n{rag_context}\n\nQUESTION: {prompt}" if rag_context else prompt
     needs_search = any(k in final_prompt.lower() for k in ["actu", "météo", "prix", "cours", "aujourd'hui", "maintenant", "google", "recherche", "news"])
+
     result = None
-    if needs_search:
+    providers_to_try = select_provider(final_prompt) # N°4: Router intelligent
+
+    if needs_search and GEMINI_KEYS:
         for i, key in enumerate(GEMINI_KEYS):
             try: result = await _call_gemini_with_key(key, i+1, final_prompt, enable_search=True); break
             except: continue
+
     if result is None:
-        for p in PROVIDERS:
-            try: result = await _call_rest(p, final_prompt); break
+        for p in providers_to_try:
+            if not p.get("key"): continue
+            try:
+                if p["name"] == "Gemini": result = await _call_gemini_with_key(p["key"], 1, final_prompt)
+                else: result = await _call_rest(p, final_prompt)
+                break
             except: continue
+
     if result is None: result = {"text": "Toutes les IA sont down", "self": {}, "sources": [], "model_used": "Aucun"}
-    await save_conversation_to_rag(prompt, result["text"])
+    await save_conversation_to_rag(user_id, prompt, result["text"])
     return result
+
+# ===== TELEGRAM POLLING BIDIRECTIONNEL =====
+async def telegram_polling(): # BONUS: Chat Telegram
+    if not telegram_bot: return
+    offset = None
+    while True:
+        try:
+            updates = await telegram_bot.get_updates(offset=offset, timeout=10)
+            for update in updates:
+                if update.message and str(update.message.chat_id) == TELEGRAM_CHAT_ID:
+                    user_text = update.message.text
+                    user_id = f"telegram_{update.message.chat_id}"
+                    logger.info(f"[TELEGRAM IN] {user_text}")
+                    ai_response = await ask_ai(user_id, user_text)
+                    await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"*{ai_response['text']}*", parse_mode='Markdown')
+                    offset = update.update_id + 1
+        except Exception as e: logger.error(f"[TELEGRAM POLLING] {e}")
+        await asyncio.sleep(1)
 
 # ===== HEARTBEAT FULL AUTO + RAPPORT TELEGRAM =====
 async def generate_diagnostic() -> dict:
@@ -263,8 +300,7 @@ async def heartbeat():
             await apply_patch(patch)
             nb_approved += 1
             await asyncio.sleep(5)
-        else:
-            logger.warning(f"[HEARTBEAT] Patch REJETÉ: {anomaly['raison']}")
+        else: logger.warning(f"[HEARTBEAT] Patch REJETÉ: {anomaly['raison']}")
     if collection_logs: collection_logs.insert_one({"timestamp": datetime.utcnow(), "diagnostic": diagnostic})
     if nb_approved > 0: await send_telegram(f"Rapport 30min: {nb_approved} patch(s) appliqué(s). Etat: {diagnostic.get('etat')}")
     logger.success("[HEARTBEAT] Terminé")
@@ -272,9 +308,10 @@ async def heartbeat():
 def start_heartbeat():
     scheduler.add_job(heartbeat, 'interval', minutes=30)
     scheduler.start()
-    logger.info("[HEARTBEAT] Scheduler lancé: toutes les 30 minutes")
+    asyncio.create_task(telegram_polling()) # Lance le chat Telegram
+    logger.info("[HEARTBEAT] Scheduler lancé: toutes les 30 minutes + Polling Telegram actif")
 
-# ===== ROUTE TTS V3.6.1 - FIX MODELE =====
+# ===== ROUTE TTS V3.7 =====
 router = APIRouter()
 
 @router.post("/tts")
@@ -285,16 +322,9 @@ async def text_to_speech(req: Request):
     client = genai.Client(api_key=GEMINI_KEYS[0])
     try:
         response = client.models.generate_content(
-            model="gemini-2.5-pro-preview-tts", # <-- FIX: Ancien modèle n'existe plus
+            model="gemini-2.5-pro-preview-tts",
             contents=f"Dites ceci avec une voix masculine britannique calme: {text}",
-            config=types.GenerateContentConfig(
-                response_modalities=["AUDIO"],
-                speech_config=types.SpeechConfig(
-                    voice_config=types.VoiceConfig(
-                        prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Kore") # Kore, Puck, Charon, Fenrir
-                    )
-                )
-            )
+            config=types.GenerateContentConfig(response_modalities=["AUDIO"], speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Kore"))))
         )
         audio_base64 = base64.b64encode(response.candidates[0].content.parts[0].inline_data.data).decode('utf-8')
         return {"audio": audio_base64}
